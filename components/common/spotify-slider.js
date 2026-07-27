@@ -173,4 +173,4 @@ export class SpotifySlider extends LitElement {
     }
 }
 
-customElements.define('spotify-slider', SpotifySlider);
+if (!customElements.get('spotify-slider')) customElements.define('spotify-slider', SpotifySlider);

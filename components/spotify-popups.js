@@ -135,4 +135,4 @@ class SpotifyPopups extends LitElement {
     }
 }
 
-customElements.define('spotify-popups', SpotifyPopups);
+if (!customElements.get('spotify-popups')) customElements.define('spotify-popups', SpotifyPopups);

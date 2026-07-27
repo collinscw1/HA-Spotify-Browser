@@ -163,4 +163,4 @@ export class SpotifySectionView extends LitElement {
     }
 }
 
-customElements.define('spotify-section-view', SpotifySectionView);
+if (!customElements.get('spotify-section-view')) customElements.define('spotify-section-view', SpotifySectionView);

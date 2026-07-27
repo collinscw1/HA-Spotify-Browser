@@ -690,4 +690,4 @@ class SpotifyHome extends LitElement {
     }
 }
 
-customElements.define('spotify-home', SpotifyHome);
+if (!customElements.get('spotify-home')) customElements.define('spotify-home', SpotifyHome);

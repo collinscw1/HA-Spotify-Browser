@@ -154,7 +154,21 @@ Options:
 
 * `prefer_sonos` — trust the Sonos entity's own state first (default `false`). Recommended when a Sonos speaker is your main player, since local Sonos playback is invisible to the Spotify API.
 * `launch_mode` — `local` (default): the bridge drives the Sonos entity directly for launches; `spotifyplus`: launches route through SpotifyPlus (best when its Web Player token auth is set up).
-* `device_map` — usually not needed (speakers auto-match by name). Entries of `{spotify: "Living Room", entity: media_player.living_room}` fix a wrong match.
+* `device_map` — speakers auto-match by name, so this is often unnecessary. Map them explicitly when auto-matching can't get it right:
+  * **the entity id doesn't match the room name** (common after moving speakers between rooms — the id keeps its original name)
+  * **two entities share a friendly name** (e.g. a stale `unavailable` entity left over from a rename); auto-matching picks whichever HA lists first
+  * **a non-Sonos device's name overlaps a speaker's** — a Chromecast called `Google Living room` substring-matches a Sonos `Living Room`, and playback gets routed to the speaker. Rule it out with `is_sonos: false`.
+
+  ```yaml
+  device_map:
+    - spotify: Living Room            # the Spotify Connect device name
+      entity: media_player.unnamed_room_2
+      is_sonos: true
+    - spotify: Google Living room     # not a speaker — don't route it to one
+      is_sonos: false
+  ```
+
+  `is_sonos` is three-state: `true` forces Sonos handling, `false` forces it off (overriding the name heuristics), and omitting it falls through to auto-detection. With `prefer_sonos`, entries are consulted in order — list your primary speaker first.
 * `debug` — log `[Sonos]` routing decisions to the console.
 
 Notes: use SpotifyPlus v1.0.95+; the Spotify account must be linked in the Sonos app; avoid controlling the same speaker from the Sonos app while the card is driving it.

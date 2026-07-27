@@ -71,10 +71,24 @@ export class SonosBridge {
     get _deviceMap() { return this.config?.device_map || []; }
 
     /**
-     * For sonos.prefer_sonos: the first device_map entity with something to
-     * show — playing/buffering beats paused across all entries; the media_title
-     * guard keeps an idle-but-on speaker (empty queue) from hijacking the
-     * display. Returns { entity, state } or null.
+     * Whether a Sonos entity is playing Spotify. Sonos reports Spotify with an
+     * `x-sonos-spotify:` content id; TV audio (`x-sonos-htastream:`), line-in
+     * and radio use entirely different schemes.
+     */
+    static _isSpotifyContent(stateObj) {
+        return String(stateObj?.attributes?.media_content_id || '').includes('spotify');
+    }
+
+    /**
+     * For sonos.prefer_sonos: the first device_map entity that is actually
+     * playing Spotify — playing/buffering beats paused across all entries; the
+     * media_title guard keeps an idle-but-on speaker (empty queue) from
+     * hijacking the display. Returns { entity, state } or null.
+     *
+     * The content check matters on a soundbar: a Sonos playing TV audio is
+     * `playing` with a `media_title`, so without it the card adopted the
+     * soundbar as its Spotify player, showed the wrong now-playing, and read an
+     * empty queue from it.
      */
     _preferredMappedEntity() {
         const states = this.hass?.states || {};
@@ -82,9 +96,15 @@ export class SonosBridge {
         const firstIn = (wanted) => {
             for (const eid of entities) {
                 const s = states[eid];
-                if (s && wanted.includes(s.state) && s.attributes?.media_title) {
-                    return { entity: eid, state: s.state };
+                if (!s || !wanted.includes(s.state) || !s.attributes?.media_title) continue;
+                if (!SonosBridge._isSpotifyContent(s)) {
+                    if (this._lastSkipped !== eid) {
+                        this._lastSkipped = eid;
+                        this.log(`prefer_sonos: skipping ${eid} — playing non-Spotify content`);
+                    }
+                    continue;
                 }
+                return { entity: eid, state: s.state };
             }
             return null;
         };
@@ -108,11 +128,22 @@ export class SonosBridge {
     isSonosTarget(device = null, attributes = {}) {
         if (!this.enabled) return false;
 
-        // 1. Manual override via device_map (matches name or id).
+        // 1. Manual override via device_map (matches name or id). An explicit
+        //    is_sonos is authoritative in BOTH directions — it is the user
+        //    telling us what this device is, so it must also be able to rule
+        //    Sonos OUT. Falling through on `false` let the name heuristics in
+        //    step 4 win instead: a Chromecast called "Google Living room"
+        //    substring-matches a Sonos speaker called "Living Room", and
+        //    playback gets routed to the wrong device entirely.
+        //    Omitted (null) still falls through to auto-detection.
         const name = device?.name || attributes?.sp_device_name || attributes?.source;
         const id = device?.id || attributes?.sp_device_id;
         const entry = this._mapEntryFor(name) || this._mapEntryFor(id);
-        if (entry?.is_sonos) return true;
+        if (entry?.is_sonos === true) return true;
+        if (entry?.is_sonos === false) {
+            this.log(`isSonosTarget("${name || id}") → false (explicit device_map override)`);
+            return false;
+        }
 
         // 2. Brand reported on the resolved device object (from get_spotify_connect_devices).
         if (device?.brand && String(device.brand).toLowerCase().includes('sonos')) return true;
@@ -238,12 +269,19 @@ export class SonosBridge {
     /**
      * Resolve the group coordinator for a Sonos entity. Grouped Sonos speakers
      * only accept playback commands on the coordinator (first entry of the
-     * `sonos_group` attribute); Spotify plays sent to a non-coordinator member
-     * can fail with UPnP error 800.
+     * group attribute); Spotify plays sent to a non-coordinator member can fail
+     * with UPnP error 800.
+     *
+     * Current Home Assistant exposes the standard media_player `group_members`
+     * attribute; older Sonos integrations used `sonos_group`. Both list the
+     * coordinator first, so read whichever is present — checking only the
+     * legacy name made this silently return the member unchanged, defeating
+     * the entire point of the function.
      */
     coordinatorFor(entity) {
         if (!entity || !this.hass) return entity;
-        const group = this.hass.states?.[entity]?.attributes?.sonos_group;
+        const attrs = this.hass.states?.[entity]?.attributes;
+        const group = attrs?.group_members || attrs?.sonos_group;
         if (Array.isArray(group) && group.length && group[0] !== entity) {
             this.log(`coordinatorFor(${entity}) → ${group[0]} (grouped)`);
             return group[0];

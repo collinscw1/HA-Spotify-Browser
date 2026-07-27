@@ -105,4 +105,4 @@ export class SpotifySidebarTrackList extends LitElement {
     }
 }
 
-customElements.define('spotify-sidebar-tracklist', SpotifySidebarTrackList);
+if (!customElements.get('spotify-sidebar-tracklist')) customElements.define('spotify-sidebar-tracklist', SpotifySidebarTrackList);

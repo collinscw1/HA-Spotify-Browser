@@ -1836,4 +1836,4 @@ class SpotifyBrowserApp extends LitElement {
     }
 }
 
-customElements.define('spotify-browser-app', SpotifyBrowserApp);
+if (!customElements.get('spotify-browser-app')) customElements.define('spotify-browser-app', SpotifyBrowserApp);

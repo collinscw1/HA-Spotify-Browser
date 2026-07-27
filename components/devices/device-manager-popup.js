@@ -589,4 +589,4 @@ export class SpotifyDeviceManagerPopup extends LitElement {
     }
 }
 
-customElements.define('spotify-popup-devicemanager', SpotifyDeviceManagerPopup);
+if (!customElements.get('spotify-popup-devicemanager')) customElements.define('spotify-popup-devicemanager', SpotifyDeviceManagerPopup);

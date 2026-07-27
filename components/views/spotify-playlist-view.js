@@ -529,6 +529,13 @@ export class SpotifyPlaylistView extends LitElement {
             }
             this._checkFollowStatus();
             this._checkPinStatus();
+            // The router reuses this element across pages, and the pager
+            // reassigns `data` per appended page — only a genuine change of
+            // list may discard the liked-state we've already resolved.
+            if (this.data?.id !== this._likesForId) {
+                this._likesForId = this.data?.id;
+                this._resetTrackLikes();
+            }
             this._checkTrackLikes();
             if (this.data?.type === 'likedsongs') this._enrichGenres();
             if (this.data?.type === 'album') {
@@ -976,17 +983,56 @@ export class SpotifyPlaylistView extends LitElement {
         }));
     }
 
+    /**
+     * Resolve liked-state for the rows we're showing.
+     *
+     * A long playlist pages in 50 tracks at a time, and every append re-renders
+     * this view — so this must only ever ask about ids it hasn't resolved yet.
+     * Re-checking the whole accumulated list once per page is what turned a
+     * large playlist into a request storm: the id count grew with each page
+     * until SpotifyPlus rejected the call outright, and the failures repeated
+     * for every remaining page.
+     *
+     * Single-flight, with one re-run if more rows arrived mid-check. Ids whose
+     * check didn't resolve are released so a later pass can retry them.
+     */
     async _checkTrackLikes() {
         if (!this.api || !this.data?.tracks?.items) return;
-        const ids = this.data.tracks.items
-            .map(item => (item.track || item)?.id)
-            .filter(Boolean);
+        if (this._likesInFlight) { this._likesPending = true; return; }
+
+        if (!this._likesChecked) this._likesChecked = new Set();
+        const ids = [];
+        for (const item of this.data.tracks.items) {
+            const id = (item.track || item)?.id;
+            if (id && !this._likesChecked.has(id)) {
+                this._likesChecked.add(id);
+                ids.push(id);
+            }
+        }
         if (ids.length === 0) return;
 
-        const results = await this.api.checkTrackFavorites(ids);
-        if (results && typeof results === 'object') {
-            this._trackLikes = { ...this._trackLikes, ...results };
+        this._likesInFlight = true;
+        try {
+            const results = await this.api.checkTrackFavorites(ids);
+            if (results && typeof results === 'object') {
+                this._trackLikes = { ...this._trackLikes, ...results };
+            } else {
+                ids.forEach(id => this._likesChecked.delete(id));
+            }
+        } finally {
+            this._likesInFlight = false;
+            if (this._likesPending) {
+                this._likesPending = false;
+                this._checkTrackLikes();
+            }
         }
+    }
+
+    /** Drop resolved liked-state when the view is reused for a different list. */
+    _resetTrackLikes() {
+        this._likesChecked = new Set();
+        this._likesPending = false;
+        this._trackLikes = {};
     }
 
     /**
@@ -1680,4 +1726,4 @@ export class SpotifyPlaylistView extends LitElement {
     }
 }
 
-customElements.define('spotify-playlist-view', SpotifyPlaylistView);
+if (!customElements.get('spotify-playlist-view')) customElements.define('spotify-playlist-view', SpotifyPlaylistView);

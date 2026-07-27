@@ -245,4 +245,4 @@ class SpotifyContextMenu extends LitElement {
     }
 }
 
-customElements.define('spotify-context-menu', SpotifyContextMenu);
+if (!customElements.get('spotify-context-menu')) customElements.define('spotify-context-menu', SpotifyContextMenu);

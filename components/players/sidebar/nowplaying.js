@@ -664,4 +664,4 @@ export class SpotifySidebarNowPlaying extends LitElement {
     }
 }
 
-customElements.define('spotify-sidebar-nowplaying', SpotifySidebarNowPlaying);
+if (!customElements.get('spotify-sidebar-nowplaying')) customElements.define('spotify-sidebar-nowplaying', SpotifySidebarNowPlaying);

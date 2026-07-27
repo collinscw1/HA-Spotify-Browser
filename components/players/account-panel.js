@@ -115,4 +115,4 @@ export class SpotifyAccountPanel extends LitElement {
     }
 }
 
-customElements.define('spotify-account-panel', SpotifyAccountPanel);
+if (!customElements.get('spotify-account-panel')) customElements.define('spotify-account-panel', SpotifyAccountPanel);

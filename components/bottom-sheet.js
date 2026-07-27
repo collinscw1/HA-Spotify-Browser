@@ -211,4 +211,4 @@ export class SpotifyBottomSheet extends LitElement {
     }
 }
 
-customElements.define('spotify-bottom-sheet', SpotifyBottomSheet);
+if (!customElements.get('spotify-bottom-sheet')) customElements.define('spotify-bottom-sheet', SpotifyBottomSheet);

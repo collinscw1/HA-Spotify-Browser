@@ -140,4 +140,4 @@ export class SpotifyContextList extends LitElement {
     }
 }
 
-customElements.define('spotify-context-list', SpotifyContextList);
+if (!customElements.get('spotify-context-list')) customElements.define('spotify-context-list', SpotifyContextList);

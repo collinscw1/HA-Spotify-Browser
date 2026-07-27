@@ -1,4 +1,5 @@
 import { debugLog, playlistSortParams } from './utils.js';
+import { RequestGovernor } from './request-governor.js';
 
 export class SpotifyApi {
     // Only these (user-initiated playback) services should surface a validation
@@ -11,6 +12,23 @@ export class SpotifyApi {
         'player_transfer_playback',
         'add_player_queue_items'
     ]);
+
+    // Calls a person just triggered. These jump the governor's queue ahead of
+    // background enrichment and are allowed to probe an open circuit breaker,
+    // so pressing play still works the moment the socket comes back. Everything
+    // else (get_*, check_*, search_*) is background work that may be shed.
+    static USER_SERVICES = new Set([
+        ...this.PLAYBACK_SERVICES,
+        'playlist_create',
+        'playlist_change',
+        'playlist_items_add',
+        'playlist_items_remove',
+        'playlist_items_reorder',
+        'playlist_items_replace',
+    ]);
+
+    // Spotify's check-favorites endpoints accept at most 50 ids per call.
+    static MAX_FAVORITE_IDS = 50;
 
     constructor(hass, entityId, deviceResolver = null, defaultVolumeConfig = null, onNotification = null, onError = null) {
         this.hass = hass;
@@ -51,6 +69,57 @@ export class SpotifyApi {
         this._onSocketReady = () => { this._socketReady = true; this._resumedAt = Date.now(); };
         this._onSocketDisconnected = () => { this._socketReady = false; };
         this._bindConnection();
+
+        // Everything below rides the shared HA WebSocket, so nothing reaches it
+        // except through the governor: bounded concurrency, a bounded queue, and
+        // a breaker that fails fast instead of hammering a dead connection.
+        // See request-governor.js for why this exists.
+        this._governor = new RequestGovernor({
+            canSend: () => this._connectionUp,
+            onStateChange: (s) => this._onGovernorState(s),
+        });
+
+        // Failure-log throttling: a burst used to emit one multi-line
+        // console.warn per call, which is its own performance problem.
+        this._logState = new Map(); // service -> { at, suppressed }
+    }
+
+    /**
+     * Breaker transitions. Opening is worth telling the user about once — it
+     * means the card has stopped talking to Home Assistant for a while — but
+     * only for a real stall, not a single blip, and never repeatedly.
+     */
+    _onGovernorState(s) {
+        if (s.state === 'open') {
+            debugLog(`[SpotifyAPI] Backing off for ${Math.round(s.openFor / 1000)}s after repeated failures`, s);
+            const now = Date.now();
+            if (s.transport && now - (this._lastBackoffNotice || 0) > 60000) {
+                this._lastBackoffNotice = now;
+                this._notify("Lost contact with Home Assistant — pausing Spotify updates.");
+            }
+        } else if (s.state === 'closed') {
+            debugLog('[SpotifyAPI] Connection recovered, resuming normal requests');
+        }
+    }
+
+    /** Log a failed call at most once per service per 5s, tallying the rest. */
+    _logFailure(service, e) {
+        const now = Date.now();
+        const prev = this._logState.get(service) || { at: 0, suppressed: 0 };
+        if (now - prev.at < 5000) {
+            this._logState.set(service, { at: prev.at, suppressed: prev.suppressed + 1 });
+            return;
+        }
+        const also = prev.suppressed ? ` (+${prev.suppressed} more suppressed)` : '';
+        // HA nests websocket failures under `error`; plain throws carry .message.
+        const detail = e?.message || e?.error?.message || e?.code || e?.error?.code || e;
+        console.warn(`[SpotifyAPI] Failed Call [${service}]${also}:`, detail);
+        this._logState.set(service, { at: now, suppressed: 0 });
+    }
+
+    /** Governor diagnostics (in-flight/queued/breaker state). */
+    get governorStats() {
+        return this._governor.stats;
     }
 
     /** (Re)subscribe to the active HA connection's ready/disconnected events. */
@@ -146,6 +215,7 @@ export class SpotifyApi {
         clearTimeout(this._readyScanTimer);
         this._readyScanTimer = null;
         this._readyScanPromise = null;
+        this._governor.destroy();
     }
 
     /**
@@ -215,7 +285,16 @@ export class SpotifyApi {
         return ok;
     }
 
-    async fetchSpotifyPlus(service, params = {}, expectResponse = true, logError = true, throwOnError = false) {
+    /**
+     * A read the user is actively waiting on — page navigation, not background
+     * enrichment. Jumps the governor's queue and may probe an open breaker, so
+     * opening an album still works while background artwork lookups are failing.
+     */
+    fetchForUser(service, params = {}, expectResponse = true) {
+        return this.fetchSpotifyPlus(service, params, expectResponse, true, false, { priority: 'user' });
+    }
+
+    async fetchSpotifyPlus(service, params = {}, expectResponse = true, logError = true, throwOnError = false, opts = {}) {
         if (!this.hass) return null;
 
         // --- FIX: MAP STANDARD CONTROLS TO MEDIA_PLAYER DOMAIN ---
@@ -288,7 +367,11 @@ export class SpotifyApi {
 
             if (expectResponse) payload.return_response = true;
 
-            const response = await this.hass.callWS(payload);
+            const response = await this._governor.run(() => this.hass.callWS(payload), {
+                priority: opts.priority
+                    || (SpotifyApi.USER_SERVICES.has(service) ? 'user' : 'background'),
+                label: service,
+            });
 
             // Transfers get no rescan from SpotifyPlus on their own, and restricted
             // Connect devices (Google Cast) are slow to appear in the Web API — so
@@ -301,6 +384,15 @@ export class SpotifyApi {
             return response;
 
         } catch (e) {
+            // Shed by the governor: this never reached Home Assistant, so it is
+            // not evidence that anything is wrong with the user's setup. Don't
+            // pop the device picker or shout about it — just fail quietly.
+            if (e?.shed) {
+                debugLog(`[SpotifyAPI] Skipped [${service}] — ${e.reason}`);
+                if (throwOnError) throw e;
+                return null;
+            }
+
             // Report major errors via callback — but ONLY for playback actions.
             // A background read (get_player_queue_info, get_*, etc.) failing
             // validation must NOT pop the "select a device" picker; that should
@@ -314,9 +406,7 @@ export class SpotifyApi {
 
             if (throwOnError) throw e;
 
-            if (logError) {
-                console.warn(`[SpotifyAPI] Failed Call [${service}]:`, JSON.stringify(e, null, 2));
-            }
+            if (logError) this._logFailure(service, e);
             return null;
         }
     }
@@ -917,13 +1007,43 @@ export class SpotifyApi {
         }
     }
 
+    /**
+     * Liked-state for one or many track ids. Single id -> boolean; multiple ->
+     * an {id: bool} map. Returns null only when nothing could be resolved.
+     *
+     * Callers hand this whole track lists (a playlist view checks every visible
+     * row), so the 50-id ceiling is enforced here rather than at each call site
+     * — exceeding it made SpotifyPlus reject the call with "Too many uris
+     * requested", and a paging view would repeat that failure once per page.
+     * Chunks run sequentially and a failed chunk is skipped, not retried.
+     */
     async checkTrackFavorites(ids) {
         if (!this.hass || !ids) return null;
+
+        const raw = Array.isArray(ids) ? ids : String(ids).split(',');
+        const idList = raw.map(id => String(id).trim()).filter(Boolean);
+        if (idList.length === 0) return null;
+        const single = !Array.isArray(ids) && !String(ids).includes(',');
+
+        const map = {};
+        let resolvedAny = false;
+        for (let i = 0; i < idList.length; i += SpotifyApi.MAX_FAVORITE_IDS) {
+            const chunk = idList.slice(i, i + SpotifyApi.MAX_FAVORITE_IDS);
+            const part = await this._checkTrackFavoritesChunk(chunk);
+            if (!part) continue; // this chunk failed — keep whatever else resolved
+            resolvedAny = true;
+            Object.assign(map, part);
+        }
+
+        if (!resolvedAny) return null;
+        return single ? (map[idList[0]] === true) : map;
+    }
+
+    /** One <=50-id `check_track_favorites` call, normalized to {id: bool}. */
+    async _checkTrackFavoritesChunk(idList) {
         try {
-            const idList = Array.isArray(ids) ? ids.slice() : String(ids).split(',');
-            const idsParam = idList.join(',');
             const res = await this.fetchSpotifyPlus('check_track_favorites', {
-                ids: idsParam
+                ids: idList.join(',')
             }, true);
 
             let result = res?.result ?? res;
@@ -950,9 +1070,7 @@ export class SpotifyApi {
                 map[idList[0]] = result;
             }
 
-            // Single id -> boolean; multiple -> the {id: bool} map.
-            const single = !Array.isArray(ids) && !idsParam.includes(',');
-            return single ? (map[idList[0]] === true) : map;
+            return map;
         } catch (e) {
             console.error("Check Track Favorites failed:", e);
             return null;
@@ -996,12 +1114,16 @@ export class SpotifyApi {
         if (!this.hass || !trackId) return null;
         if (!this._trackArtCache) this._trackArtCache = new Map();
         if (this._trackArtCache.has(trackId)) return this._trackArtCache.get(trackId);
-        let url = null;
-        try {
-            const res = await this.fetchSpotifyPlus('get_track', { track_id: trackId });
-            const track = res?.result || res;
-            url = track?.album?.images?.[0]?.url || null;
-        } catch (e) { url = null; }
+
+        const res = await this.fetchSpotifyPlus('get_track', { track_id: trackId });
+        // Only a call that actually answered may populate the cache. A failed,
+        // timed-out or shed call is not evidence that the track has no artwork —
+        // caching null for it would permanently blank that track for the rest of
+        // the session, even once the connection recovers.
+        if (!res) return null;
+
+        const track = res.result || res;
+        const url = track?.album?.images?.[0]?.url || null;
         this._trackArtCache.set(trackId, url);
         return url;
     }

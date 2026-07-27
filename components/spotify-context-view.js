@@ -262,6 +262,7 @@ export class SpotifyContextView extends LitElement {
 
     async loadPageData() {
         if (!this.pageId) return;
+        const pageId = this.pageId;
 
         let type, id;
         if (this.pageId === 'likedsongs') {
@@ -310,7 +311,7 @@ export class SpotifyContextView extends LitElement {
                 // snapshotId, public/collaborative and a trustworthy
                 // tracks.total — all needed for edit support. Only the first
                 // page (<=100 tracks) comes inline; the rest pages in below.
-                const response = await this.api.fetchSpotifyPlus('get_playlist', { playlist_id: id });
+                const response = await this.api.fetchForUser('get_playlist', { playlist_id: id });
                 if (response?.result) {
                     const result = response.result;
 
@@ -355,7 +356,7 @@ export class SpotifyContextView extends LitElement {
                 }
             } else if (type === 'artist') {
                 // Artist pages load progressively: each promise updates state + cache as it resolves.
-                const artistPromise = this.api.fetchSpotifyPlus('get_artist', { artist_id: id });
+                const artistPromise = this.api.fetchForUser('get_artist', { artist_id: id });
                 const albumsPromise = this.api.fetchSpotifyPlus('get_artist_albums', { artist_id: id, limit: 12 });
                 const topTracksPromise = (async () => {
                     try {
@@ -422,13 +423,13 @@ export class SpotifyContextView extends LitElement {
                 });
 
             } else if (type === 'album') {
-                const response = await this.api.fetchSpotifyPlus('get_album', { album_id: id });
+                const response = await this.api.fetchForUser('get_album', { album_id: id });
                 if (response?.result) {
                     let albumData = response.result;
 
                     // Check if tracks are missing or empty (API quirk)
                     if (!albumData.tracks || !albumData.tracks.items || albumData.tracks.items.length === 0) {
-                        const tracksRes = await this.api.fetchSpotifyPlus('get_album_tracks', { album_id: id, limit: 50 });
+                        const tracksRes = await this.api.fetchForUser('get_album_tracks', { album_id: id, limit: 50 });
                         if (tracksRes?.result?.items) {
                             if (!albumData.tracks) albumData.tracks = {};
                             albumData.tracks.items = tracksRes.result.items;
@@ -453,7 +454,7 @@ export class SpotifyContextView extends LitElement {
                 }
                 const limit = 50;
                 const offset = 0;
-                const albumsPromise = this.api.fetchSpotifyPlus('get_artist_albums', { artist_id: id, limit: limit, offset: offset });
+                const albumsPromise = this.api.fetchForUser('get_artist_albums', { artist_id: id, limit: limit, offset: offset });
                 const albumsRes = await albumsPromise;
                 const items = albumsRes?.result?.items || [];
                 const total = albumsRes?.result?.total || 0;
@@ -539,6 +540,22 @@ export class SpotifyContextView extends LitElement {
             }
         } catch (e) {
             console.error("Failed to load context data", e);
+        } finally {
+            // Never strand the view on the "Loading..." placeholder. Several
+            // branches above (album, playlist, artist) only populate state on
+            // success, so a failed or shed fetch left the page loading forever
+            // with no visible error — the user saw a permanent spinner while
+            // the real cause sat in the console.
+            if (this.pageId === pageId && this._contextData?.isLoading) {
+                this._contextData = {
+                    ...this._contextData,
+                    isLoading: false,
+                    hasMore: false,
+                    name: this._contextData.name === 'Loading...'
+                        ? "Couldn't load" : this._contextData.name,
+                };
+                this.requestUpdate();
+            }
         }
     }
 
@@ -822,4 +839,4 @@ export class SpotifyContextView extends LitElement {
 
 }
 
-customElements.define('spotify-context-view', SpotifyContextView);
+if (!customElements.get('spotify-context-view')) customElements.define('spotify-context-view', SpotifyContextView);

@@ -447,4 +447,4 @@ class SpotifyReorderDialog extends LitElement {
     }
 }
 
-customElements.define('spotify-reorder-dialog', SpotifyReorderDialog);
+if (!customElements.get('spotify-reorder-dialog')) customElements.define('spotify-reorder-dialog', SpotifyReorderDialog);

@@ -452,4 +452,4 @@ class SpotifySearch extends LitElement {
     }
 }
 
-customElements.define('spotify-search', SpotifySearch);
+if (!customElements.get('spotify-search')) customElements.define('spotify-search', SpotifySearch);

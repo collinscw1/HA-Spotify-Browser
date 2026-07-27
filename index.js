@@ -169,4 +169,27 @@ class SpotifyExtension {
     }
 }
 
-new SpotifyExtension();
+/*
+ * Single-instance guard.
+ *
+ * A dashboard can end up loading this script more than once — most easily by
+ * adding a second Resources entry when bumping a `?v=` cache-buster, since the
+ * browser treats each URL as a separate module and evaluates both. Every copy
+ * would otherwise mount its own app on document.body, with its own API client,
+ * request governor, player controller and 200ms hass poll: double the traffic
+ * to the shared WebSocket, and two UIs fighting over the same state.
+ *
+ * The element definitions above are individually guarded so a second load no
+ * longer throws, but silently doing twice the work is its own failure. Claim a
+ * global marker instead, and say so loudly enough to be fixable.
+ */
+const INSTANCE_KEY = '__spotifyBrowserExtension';
+if (window[INSTANCE_KEY]) {
+    console.warn(
+        '[SpotifyBrowser] Already initialised on this page — ignoring a duplicate script load. ' +
+        'Check Settings → Dashboards → Resources for more than one spotify-browser.js entry ' +
+        '(bump the ?v= on the existing row rather than adding a new one).'
+    );
+} else {
+    window[INSTANCE_KEY] = new SpotifyExtension();
+}
