@@ -75,6 +75,13 @@ const DEFAULTS = {
     // Liked Songs or refreshing Connect devices legitimately takes many seconds.
     callTimeoutMs: 15000,
     userCallTimeoutMs: 45000,
+    // When the backend has stopped answering entirely (see _looksStalled), back
+    // off far harder than the normal ceiling. The observed cause is an upstream
+    // quota window measured in hours — Spotify returned Retry-After: 8806 —
+    // during which every retry is wasted and may extend the block further.
+    // Two-minute retries across 2.5 hours is ~75 pointless requests.
+    stalledOpenMs: 900000,   // 15 minutes
+    stalledThreshold: 3,     // consecutive timeouts before we call it stalled
 };
 
 export class RequestGovernor {
@@ -93,6 +100,8 @@ export class RequestGovernor {
         this._active = 0;
         this._activeEntries = new Set(); // in-flight entries, for diagnostics
         this._consecutiveFailures = 0;
+        this._consecutiveTimeouts = 0; // drives the stalled-backend diagnosis
+        this._stalled = false;
         this._openUntil = 0;       // breaker open through this timestamp
         this._openStreak = 0;      // consecutive trips, drives the backoff
         this._probeInFlight = false;
@@ -119,6 +128,9 @@ export class RequestGovernor {
             open: this.isOpen,
             openFor: Math.max(0, this._openUntil - now),
             consecutiveFailures: this._consecutiveFailures,
+            // True when the backend is accepting calls and never answering —
+            // the signature of an upstream quota/rate block. See _looksStalled.
+            stalled: this._stalled && this.isOpen,
         };
     }
 
@@ -257,20 +269,44 @@ export class RequestGovernor {
     _onSuccess() {
         const wasOpen = this._openStreak > 0 || this.isOpen;
         this._consecutiveFailures = 0;
+        this._consecutiveTimeouts = 0;
+        this._stalled = false;
         this._openUntil = 0;
         this._openStreak = 0;
         if (wasOpen) this._notify('closed');
     }
 
+    /**
+     * Whether the backend has stopped answering altogether, as opposed to
+     * failing. The distinguishing signature is repeated *timeouts* — calls that
+     * were accepted and never answered — rather than errors, while the
+     * transport itself is healthy.
+     *
+     * In practice this means the integration is blocked upstream: the observed
+     * case was Spotify returning 429/QUOTA_EXCEEDED, which SpotifyPlus handles
+     * by sleeping for the Retry-After (hours) without logging. Retrying into
+     * that window is useless and may extend it, so it warrants a much longer
+     * backoff than ordinary failures.
+     */
+    _looksStalled() {
+        return this._consecutiveTimeouts >= this.stalledThreshold && this.canSend();
+    }
+
     _onFailure(e, wasProbe = false) {
         this._consecutiveFailures++;
+        if (e?.timeout) this._consecutiveTimeouts++;
+        else this._consecutiveTimeouts = 0;
+
         // A failed half-open probe re-trips immediately — it was the one call
         // we allowed through specifically to answer "are we healthy yet?".
         if (!wasProbe && this._consecutiveFailures < this.failureThreshold && !this.isOpen) return;
 
         // Trip (or re-trip, after a failed probe) with exponential backoff.
         this._openStreak++;
-        const openFor = Math.min(this.openMs * (2 ** (this._openStreak - 1)), this.maxOpenMs);
+        this._stalled = this._looksStalled();
+        const openFor = this._stalled
+            ? this.stalledOpenMs
+            : Math.min(this.openMs * (2 ** (this._openStreak - 1)), this.maxOpenMs);
         this._openUntil = Date.now() + openFor;
         this._consecutiveFailures = 0;
 
@@ -279,7 +315,26 @@ export class RequestGovernor {
         const abandoned = this._queue.splice(0, this._queue.length);
         abandoned.forEach(q => q.reject(new GovernorRejection('circuit-open', q.label)));
 
-        this._notify('open', { openFor, transport: isTransportError(e) });
+        this._notify('open', {
+            openFor,
+            transport: isTransportError(e),
+            stalled: this._stalled,
+        });
+    }
+
+    /**
+     * Clear a stalled/open breaker on explicit user request ("Retry"). Distinct
+     * from the automatic half-open probe: the user may know the upstream
+     * problem is fixed long before the backoff would have expired.
+     */
+    resume() {
+        this._openUntil = 0;
+        this._openStreak = 0;
+        this._consecutiveFailures = 0;
+        this._consecutiveTimeouts = 0;
+        this._stalled = false;
+        this._notify('closed');
+        this._drain();
     }
 
     _notify(state, detail = {}) {

@@ -248,6 +248,73 @@ test('repeated timeouts eventually trip the breaker', async () => {
     g.destroy();
 });
 
+test('repeated timeouts are diagnosed as a stalled backend, not a flaky one', async () => {
+    const events = [];
+    const g = new RequestGovernor({
+        maxConcurrent: 1, callTimeoutMs: 10, failureThreshold: 3,
+        stalledThreshold: 3, openMs: 15_000, maxOpenMs: 120_000, stalledOpenMs: 900_000,
+        onStateChange: (s) => events.push(s),
+    });
+
+    for (let i = 0; i < 3; i++) await settle(g.run(neverResolves, { label: 'get_track' }));
+
+    const open = events.find(e => e.state === 'open');
+    assert.equal(open.stalled, true, 'unanswered calls should read as stalled');
+    assert.equal(g.stats.stalled, true);
+    // A quota window is hours; the ordinary ceiling would retry every 2 minutes.
+    assert.ok(open.openFor >= 900_000, `backed off only ${open.openFor}ms`);
+    g.destroy();
+});
+
+test('ordinary errors keep the short backoff', async () => {
+    const events = [];
+    const g = new RequestGovernor({
+        maxConcurrent: 1, failureThreshold: 3, stalledThreshold: 3,
+        openMs: 15_000, maxOpenMs: 120_000, stalledOpenMs: 900_000,
+        onStateChange: (s) => events.push(s),
+    });
+
+    for (let i = 0; i < 3; i++) await settle(g.run(async () => { throw connLost(); }));
+
+    const open = events.find(e => e.state === 'open');
+    assert.equal(open.stalled, false, 'errors are not the stalled signature');
+    assert.ok(open.openFor <= 120_000, 'should use the ordinary ceiling');
+    g.destroy();
+});
+
+test('a success clears the stalled diagnosis', async () => {
+    const g = new RequestGovernor({
+        maxConcurrent: 1, callTimeoutMs: 10, failureThreshold: 2, stalledThreshold: 2,
+        stalledOpenMs: 900_000,
+    });
+    for (let i = 0; i < 2; i++) await settle(g.run(neverResolves));
+    assert.equal(g.stats.stalled, true);
+
+    // A user action probes the open breaker and succeeds.
+    const r = await settle(g.run(async () => 'ok', { priority: 'user' }));
+    assert.equal(r.ok, true);
+    assert.equal(g.stats.stalled, false);
+    assert.equal(g.isOpen, false);
+    g.destroy();
+});
+
+test('resume() clears a long stall on user request', async () => {
+    const g = new RequestGovernor({
+        maxConcurrent: 1, callTimeoutMs: 10, failureThreshold: 2, stalledThreshold: 2,
+        stalledOpenMs: 900_000,
+    });
+    for (let i = 0; i < 2; i++) await settle(g.run(neverResolves));
+    assert.equal(g.isOpen, true);
+
+    g.resume();
+
+    assert.equal(g.isOpen, false, 'user retry should not wait out a 15-minute backoff');
+    assert.equal(g.stats.stalled, false);
+    const r = await settle(g.run(async () => 'ok'));
+    assert.equal(r.ok, true, 'background work flows again after resume');
+    g.destroy();
+});
+
 test('destroy rejects queued work and stops accepting more', async () => {
     const g = new RequestGovernor({ maxConcurrent: 1 });
     const probe = { active: 0, peak: 0 };

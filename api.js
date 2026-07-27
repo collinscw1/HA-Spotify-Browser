@@ -1,5 +1,16 @@
 import { debugLog, playlistSortParams } from './utils.js';
 import { RequestGovernor } from './request-governor.js';
+import { MetadataCache } from './metadata-cache.js';
+
+/*
+ * Immutable-metadata caches, shared across every instance and persisted across
+ * page loads. Album art and artist genres never change for a given id, so
+ * re-fetching them per session spends the Spotify developer app's finite
+ * request quota for nothing — and exhausting that quota is what makes every
+ * call appear to hang (SpotifyPlus sleeps on the 429's multi-hour Retry-After).
+ */
+const TRACK_ART_CACHE = new MetadataCache('track-art', { maxEntries: 1000 });
+const ARTIST_GENRE_CACHE = new MetadataCache('artist-genres', { maxEntries: 500 });
 
 export class SpotifyApi {
     // Only these (user-initiated playback) services should surface a validation
@@ -93,13 +104,35 @@ export class SpotifyApi {
         if (s.state === 'open') {
             debugLog(`[SpotifyAPI] Backing off for ${Math.round(s.openFor / 1000)}s after repeated failures`, s);
             const now = Date.now();
-            if (s.transport && now - (this._lastBackoffNotice || 0) > 60000) {
+            const quiet = now - (this._lastBackoffNotice || 0) < 60000;
+
+            if (s.stalled && !quiet) {
+                // Calls are being accepted and never answered while Home
+                // Assistant itself is fine. In practice that means SpotifyPlus
+                // is blocked upstream — most often the Spotify developer app's
+                // request quota, which it waits out silently for hours.
+                this._lastBackoffNotice = now;
+                console.warn(
+                    '[SpotifyAPI] SpotifyPlus is accepting requests but never answering them, ' +
+                    'while Home Assistant is responsive. This usually means the Spotify developer ' +
+                    'app has exceeded its request quota (HTTP 429 / QUOTA_EXCEEDED), which the ' +
+                    'integration waits out silently. Check the Spotify developer dashboard. ' +
+                    `Pausing requests for ${Math.round(s.openFor / 60000)} minutes.`
+                );
+                this._notify("Spotify isn't responding — it may have hit its request limit.");
+            } else if (s.transport && !quiet) {
                 this._lastBackoffNotice = now;
                 this._notify("Lost contact with Home Assistant — pausing Spotify updates.");
             }
         } else if (s.state === 'closed') {
             debugLog('[SpotifyAPI] Connection recovered, resuming normal requests');
         }
+    }
+
+    /** Clear an open/stalled breaker on explicit user request ("Retry"). */
+    resume() {
+        this._lastBackoffNotice = 0;
+        this._governor.resume();
     }
 
     /** Log a failed call at most once per service per 5s, tallying the rest. */
@@ -1094,15 +1127,16 @@ export class SpotifyApi {
     // genres (may be empty). Used to build the Liked Songs filter pills.
     async getArtistGenres(artistId) {
         if (!this.hass || !artistId) return [];
-        if (!this._artistGenreCache) this._artistGenreCache = new Map();
-        if (this._artistGenreCache.has(artistId)) return this._artistGenreCache.get(artistId);
-        let genres = [];
-        try {
-            const res = await this.fetchSpotifyPlus('get_artist', { artist_id: artistId });
-            genres = res?.result?.genres || res?.genres || [];
-        } catch (e) { genres = []; }
-        this._artistGenreCache.set(artistId, genres);
-        return genres;
+        if (ARTIST_GENRE_CACHE.has(artistId)) return ARTIST_GENRE_CACHE.get(artistId);
+
+        const res = await this.fetchSpotifyPlus('get_artist', { artist_id: artistId });
+        // Only cache a call that answered. A failed, timed-out or shed request
+        // says nothing about the artist, and caching [] would hide their genres
+        // for good (the cache is durable now — a bad entry outlives the reload).
+        if (!res) return [];
+
+        const genres = res.result?.genres || res.genres || [];
+        return ARTIST_GENRE_CACHE.set(artistId, genres);
     }
 
     /**
@@ -1112,20 +1146,18 @@ export class SpotifyApi {
      */
     async getTrackArt(trackId) {
         if (!this.hass || !trackId) return null;
-        if (!this._trackArtCache) this._trackArtCache = new Map();
-        if (this._trackArtCache.has(trackId)) return this._trackArtCache.get(trackId);
+        if (TRACK_ART_CACHE.has(trackId)) return TRACK_ART_CACHE.get(trackId);
 
         const res = await this.fetchSpotifyPlus('get_track', { track_id: trackId });
         // Only a call that actually answered may populate the cache. A failed,
         // timed-out or shed call is not evidence that the track has no artwork —
-        // caching null for it would permanently blank that track for the rest of
-        // the session, even once the connection recovers.
+        // and since this cache is durable, a bad entry would blank that track
+        // across reloads, not just for the session.
         if (!res) return null;
 
         const track = res.result || res;
         const url = track?.album?.images?.[0]?.url || null;
-        this._trackArtCache.set(trackId, url);
-        return url;
+        return TRACK_ART_CACHE.set(trackId, url);
     }
 
     async searchPlaylists(query, limit = 10, offset = 0) {
