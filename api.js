@@ -1214,6 +1214,24 @@ export class SpotifyApi {
         return TRACK_ART_CACHE.set(trackId, url);
     }
 
+    /**
+     * Multi-type search backing the search page.
+     *
+     * `limit` is per result type (Spotify caps it at 50). It must be sent
+     * explicitly and in range: SpotifyPlus validates it and rejects the whole
+     * call with "Validation error: Invalid limit" otherwise — which is what
+     * happened when this passed only `limit_total`, breaking search entirely.
+     */
+    async searchAll(criteria, limit = 20) {
+        if (!this.hass || !criteria) return null;
+        const perType = Math.min(50, Math.max(1, Math.floor(Number(limit)) || 20));
+        return this.fetchForUser('search_all', {
+            criteria,
+            criteria_type: 'album,artist,playlist,track',
+            limit: perType,
+        });
+    }
+
     async searchPlaylists(query, limit = 10, offset = 0) {
         if (!this.hass || !query) return { result: { items: [] } };
 

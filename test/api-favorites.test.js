@@ -196,6 +196,55 @@ test('returns null only when every chunk fails', async () => {
     api.destroy();
 });
 
+test('search sends an explicit, in-range limit', async () => {
+    // SpotifyPlus rejects the whole call with "Invalid limit" if `limit` is
+    // missing or out of range — passing only limit_total broke search entirely.
+    const hass = fakeHass(() => ({ response: { result: {} } }));
+    const api = new SpotifyApi(hass, 'media_player.spotify');
+
+    await api.searchAll('daft punk');
+
+    const sent = hass.calls[0].service_data;
+    assert.equal(hass.calls[0].service, 'search_all');
+    assert.equal(sent.criteria, 'daft punk');
+    assert.ok(Number.isInteger(sent.limit), 'limit must be sent as an integer');
+    assert.ok(sent.limit >= 1 && sent.limit <= 50, `limit ${sent.limit} out of range`);
+    assert.equal('limit_total' in sent, false, 'limit_total alone is what broke it');
+    api.destroy();
+});
+
+test('search clamps a nonsense limit into range', async () => {
+    const hass = fakeHass(() => ({ response: { result: {} } }));
+    const api = new SpotifyApi(hass, 'media_player.spotify');
+
+    for (const bad of [0, -5, 999, NaN, undefined, 'abc']) {
+        hass.calls.length = 0;
+        await api.searchAll('q', bad);
+        const { limit } = hass.calls[0].service_data;
+        assert.ok(Number.isInteger(limit) && limit >= 1 && limit <= 50,
+            `limit ${limit} from input ${String(bad)} is out of range`);
+    }
+    api.destroy();
+});
+
+test('search is user-priority, so it is not shed by failing background work', async () => {
+    const hass = fakeHass((payload) => {
+        if (payload.service === 'get_track') {
+            throw Object.assign(new Error('Connection lost'), { code: 3 });
+        }
+        return { response: { result: { artists: { items: [] } } } };
+    });
+    const api = new SpotifyApi(hass, 'media_player.spotify');
+
+    await Promise.all(Array.from({ length: 20 }, (_, i) =>
+        api.fetchSpotifyPlus('get_track', { track_id: `t${i}` })));
+    assert.equal(api.governorStats.open, true);
+
+    const res = await api.searchAll('daft punk');
+    assert.ok(res?.result, 'a search the user just typed must still go out');
+    api.destroy();
+});
+
 test('reads are held to the governor concurrency cap', async () => {
     let active = 0, peak = 0;
     const hass = fakeHass(async () => {
