@@ -242,7 +242,7 @@ test('stats name the in-flight and queued calls', async () => {
 });
 
 test('repeated timeouts eventually trip the breaker', async () => {
-    const g = new RequestGovernor({ maxConcurrent: 1, callTimeoutMs: 10, failureThreshold: 3 });
+    const g = new RequestGovernor({ maxConcurrent: 1, callTimeoutMs: 60, failureThreshold: 3 });
     for (let i = 0; i < 3; i++) await settle(g.run(neverResolves, { label: 'get_album' }));
     assert.equal(g.isOpen, true, 'a service that never answers should back off');
     g.destroy();
@@ -251,7 +251,7 @@ test('repeated timeouts eventually trip the breaker', async () => {
 test('repeated timeouts are diagnosed as a stalled backend, not a flaky one', async () => {
     const events = [];
     const g = new RequestGovernor({
-        maxConcurrent: 1, callTimeoutMs: 10, failureThreshold: 3,
+        maxConcurrent: 1, callTimeoutMs: 60, failureThreshold: 3,
         stalledThreshold: 3, openMs: 15_000, maxOpenMs: 120_000, stalledOpenMs: 900_000,
         onStateChange: (s) => events.push(s),
     });
@@ -284,7 +284,7 @@ test('ordinary errors keep the short backoff', async () => {
 
 test('a success clears the stalled diagnosis', async () => {
     const g = new RequestGovernor({
-        maxConcurrent: 1, callTimeoutMs: 10, failureThreshold: 2, stalledThreshold: 2,
+        maxConcurrent: 1, callTimeoutMs: 60, failureThreshold: 2, stalledThreshold: 2,
         stalledOpenMs: 900_000,
     });
     for (let i = 0; i < 2; i++) await settle(g.run(neverResolves));
@@ -300,7 +300,7 @@ test('a success clears the stalled diagnosis', async () => {
 
 test('resume() clears a long stall on user request', async () => {
     const g = new RequestGovernor({
-        maxConcurrent: 1, callTimeoutMs: 10, failureThreshold: 2, stalledThreshold: 2,
+        maxConcurrent: 1, callTimeoutMs: 60, failureThreshold: 2, stalledThreshold: 2,
         stalledOpenMs: 900_000,
     });
     for (let i = 0; i < 2; i++) await settle(g.run(neverResolves));
