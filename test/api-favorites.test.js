@@ -1,6 +1,13 @@
-import { test } from 'node:test';
+import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { SpotifyApi } from '../api.js';
+import { SpotifyApi, resetLearnedApiLimits } from '../api.js';
+
+/*
+ * The learned batch size persists via MetadataCache, which is module-level and
+ * therefore shared across tests in this process. Clear it so each test starts
+ * from the unprobed default rather than inheriting a neighbour's discovery.
+ */
+beforeEach(() => resetLearnedApiLimits());
 
 /** Minimal hass double: records every call_service payload it is handed. */
 function fakeHass(handler) {
@@ -123,6 +130,48 @@ test('the reduced batch size is remembered for later calls', async () => {
     assert.ok(sizes.every(n => n <= ACCEPTS),
         'second call should start at the learned size, not re-probe the ceiling');
     assert.ok(rejectionsFirst > sizes.length, 'first call paid the discovery cost');
+    api.destroy();
+});
+
+test('the learned batch size survives a new session', async () => {
+    const ACCEPTS = 25;
+    const handler = (payload) => {
+        const sent = payload.service_data.ids.split(',');
+        if (sent.length > ACCEPTS) {
+            throw Object.assign(new Error('Validation error: Too many uris requested'),
+                { code: 'service_validation_error' });
+        }
+        return echoLiked(payload);
+    };
+
+    // First "page load" discovers the ceiling.
+    const first = new SpotifyApi(fakeHass(handler), 'media_player.spotify');
+    await first.checkTrackFavorites(ids(60));
+    first.destroy();
+
+    // A brand-new instance (i.e. after a reload) should not pay for it again.
+    const hass2 = fakeHass(handler);
+    const second = new SpotifyApi(hass2, 'media_player.spotify');
+    await second.checkTrackFavorites(ids(60, 'b'));
+
+    const sizes = hass2.calls.map(c => c.service_data.ids.split(',').length);
+    assert.ok(sizes.every(n => n <= ACCEPTS),
+        'a fresh instance should start from the persisted size, not re-probe');
+    second.destroy();
+});
+
+test('a corrupt persisted limit falls back to the default', async () => {
+    const hass = fakeHass(echoLiked);
+    const api = new SpotifyApi(hass, 'media_player.spotify');
+    // Simulate a garbage entry surviving from an older build.
+    api._favoriteBatchSize = null;
+    const { MetadataCache } = await import('../metadata-cache.js');
+    new MetadataCache('api-limits').set('favorite-batch', 'not-a-number');
+
+    await api.checkTrackFavorites(ids(10));
+
+    assert.ok(hass.calls.length >= 1, 'still made the call');
+    assert.ok(hass.calls[0].service_data.ids.split(',').length <= 50);
     api.destroy();
 });
 

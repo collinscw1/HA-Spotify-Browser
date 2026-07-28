@@ -12,6 +12,23 @@ import { MetadataCache } from './metadata-cache.js';
 const TRACK_ART_CACHE = new MetadataCache('track-art', { maxEntries: 1000 });
 const ARTIST_GENRE_CACHE = new MetadataCache('artist-genres', { maxEntries: 500 });
 
+/*
+ * Limits discovered by probing, rather than metadata. SpotifyPlus's accepted
+ * batch sizes are undocumented and version-dependent, so the card learns them
+ * by being refused once — and persisting that means paying the rejected call
+ * once per device, instead of once per page load.
+ */
+const API_LIMITS_CACHE = new MetadataCache('api-limits', { maxEntries: 20 });
+
+/**
+ * Forget probed API limits, so the next call re-discovers them. Useful if a
+ * SpotifyPlus upgrade raises a ceiling, and required by tests (the cache is
+ * module-level and would otherwise leak between them).
+ */
+export function resetLearnedApiLimits() {
+    API_LIMITS_CACHE.clear();
+}
+
 export class SpotifyApi {
     // Only these (user-initiated playback) services should surface a validation
     // error to the app's error callback, which opens the device picker. Reads
@@ -1066,9 +1083,16 @@ export class SpotifyApi {
         if (idList.length === 0) return null;
         const single = !Array.isArray(ids) && !String(ids).includes(',');
 
-        // Batch size adapts down on rejection and is remembered for the session,
-        // so a too-large ceiling costs one wasted call rather than one per page.
-        if (!this._favoriteBatchSize) this._favoriteBatchSize = SpotifyApi.MAX_FAVORITE_IDS;
+        // Batch size adapts down on rejection and is remembered across sessions,
+        // so discovering the ceiling costs one refused call per device rather
+        // than one per page load. Clamped in case of a stale/garbage entry.
+        if (!this._favoriteBatchSize) {
+            const learned = Number(API_LIMITS_CACHE.get('favorite-batch'));
+            this._favoriteBatchSize = Number.isFinite(learned) && learned > 0
+                ? Math.min(SpotifyApi.MAX_FAVORITE_IDS,
+                    Math.max(SpotifyApi.MIN_FAVORITE_IDS, Math.floor(learned)))
+                : SpotifyApi.MAX_FAVORITE_IDS;
+        }
 
         const map = {};
         let resolvedAny = false;
@@ -1081,6 +1105,7 @@ export class SpotifyApi {
                 if (size > SpotifyApi.MIN_FAVORITE_IDS) {
                     this._favoriteBatchSize = Math.max(
                         SpotifyApi.MIN_FAVORITE_IDS, Math.floor(size / 2));
+                    API_LIMITS_CACHE.set('favorite-batch', this._favoriteBatchSize);
                     debugLog(`[SpotifyAPI] check_track_favorites batch too large — retrying at ${this._favoriteBatchSize}`);
                     continue; // same slice, smaller batch
                 }
