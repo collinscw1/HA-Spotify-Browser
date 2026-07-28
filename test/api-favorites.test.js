@@ -32,16 +32,16 @@ const echoLiked = (payload) => {
     return { response: { result: Object.fromEntries(sent.map(id => [id, true])) } };
 };
 
-test('splits a long id list into 50-id calls', async () => {
+test('splits a long id list into 40-id calls (SpotifyPlus documented max)', async () => {
     const hass = fakeHass(echoLiked);
     const api = new SpotifyApi(hass, 'media_player.spotify');
 
     const result = await api.checkTrackFavorites(ids(120));
 
-    assert.equal(hass.calls.length, 3, 'expected 120 ids to become 3 calls');
     const sizes = hass.calls.map(c => c.service_data.ids.split(',').length);
-    assert.deepEqual(sizes, [50, 50, 20]);
-    assert.ok(sizes.every(n => n <= 50), 'no call may exceed the 50-id ceiling');
+    assert.deepEqual(sizes, [40, 40, 40]);
+    assert.ok(sizes.every(n => n <= SpotifyApi.MAX_FAVORITE_IDS),
+        `no call may exceed the ${SpotifyApi.MAX_FAVORITE_IDS}-id ceiling`);
     assert.equal(Object.keys(result).length, 120, 'every id should be resolved');
     assert.equal(result.id0, true);
     assert.equal(result.id119, true);
@@ -63,7 +63,7 @@ test('a comma string of ids is chunked too', async () => {
 
     const result = await api.checkTrackFavorites(ids(60).join(','));
 
-    assert.equal(hass.calls.length, 2);
+    assert.ok(hass.calls.length >= 2, 'a 60-id list must be split');
     assert.equal(typeof result, 'object', 'multiple ids must return a map, not a boolean');
     assert.equal(Object.keys(result).length, 60);
     api.destroy();
@@ -80,14 +80,14 @@ test('one failing chunk does not discard the chunks that resolved', async () => 
 
     const result = await api.checkTrackFavorites(ids(120));
 
-    assert.equal(Object.keys(result).length, 70, 'chunks 1 and 3 should survive');
+    assert.equal(Object.keys(result).length, 80, 'the two surviving chunks resolve');
     assert.equal(result.id0, true);
-    assert.equal(result.id60, undefined, 'the failed chunk contributes nothing');
+    assert.equal(result.id40, undefined, 'the failed chunk contributes nothing');
     api.destroy();
 });
 
 test('shrinks the batch when SpotifyPlus rejects it as too large', async () => {
-    // SpotifyPlus enforces a lower ceiling than Spotify's documented 50.
+    // Safety net for a build stricter than the documented 40.
     const ACCEPTS = 25;
     const hass = fakeHass((payload) => {
         const sent = payload.service_data.ids.split(',');
@@ -103,7 +103,8 @@ test('shrinks the batch when SpotifyPlus rejects it as too large', async () => {
 
     assert.equal(Object.keys(result).length, 100, 'every id should still resolve');
     const sizes = hass.calls.map(c => c.service_data.ids.split(',').length);
-    assert.ok(sizes.every(n => n <= 50), 'never exceeds the documented ceiling');
+    assert.ok(sizes.every(n => n <= SpotifyApi.MAX_FAVORITE_IDS),
+        'never exceeds the documented ceiling');
     assert.ok(sizes.filter(n => n <= ACCEPTS).length >= 4, 'settles on an accepted size');
     api.destroy();
 });

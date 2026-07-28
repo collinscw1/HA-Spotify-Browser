@@ -55,12 +55,13 @@ export class SpotifyApi {
         'playlist_items_replace',
     ]);
 
-    // Spotify's check-favorites endpoints accept at most 50 ids per call, but
-    // SpotifyPlus enforces its own (undocumented, lower) ceiling and rejects
-    // larger batches with "Validation error: Too many uris requested". Rather
-    // than hard-code a guess, start at Spotify's limit and halve on rejection
-    // until it's accepted — see _checkTrackFavoritesChunk.
-    static MAX_FAVORITE_IDS = 50;
+    // SpotifyPlus's services.yaml is explicit for every check/save/remove/follow
+    // service: "A maximum of 40 id's may be specified." (Spotify's own
+    // check-saved-tracks endpoint allows 50; the integration is stricter.)
+    // Exceeding it fails the call with "Validation error: Too many uris
+    // requested", so start at the documented ceiling — the adaptive halving in
+    // checkTrackFavorites remains as a safety net for other builds.
+    static MAX_FAVORITE_IDS = 40;
     static MIN_FAVORITE_IDS = 5;
 
     /** Marker: the batch was refused for being too large, so retry it smaller. */
@@ -1217,9 +1218,11 @@ export class SpotifyApi {
     /*
      * --- SEARCH ---
      *
-     * SpotifyPlus's search services cap `limit` at 10 ("Default is 5, Range is
-     * 1 to 10" in services.yaml) — well below Spotify's own ceiling. Exceeding
-     * it fails the whole call with "Validation error: Invalid limit", and
+     * Search `limit` is capped at 10, not 50. That is Spotify's own documented
+     * range for GET /v1/search ("Default: 5, Range: 0 - 10"), and SpotifyPlus
+     * mirrors it exactly ("Default is 5, Range is 1 to 10" in services.yaml).
+     * Exceeding it fails the whole call with "Validation error: Invalid limit",
+     * and
      * `search_all` doesn't accept `limit` at all: it takes `limit_total`, and
      * passing `limit` fails with "extra keys not allowed @ data['limit']".
      *
