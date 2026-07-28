@@ -215,6 +215,37 @@ test('search_all uses limit_total, never limit', async () => {
     api.destroy();
 });
 
+test('artist albums clamps to 10 — Spotify caps that endpoint, not 50', async () => {
+    // GET /artists/{id}/albums defines its own inline limit (max 10) rather
+    // than the shared max-50 QueryLimit. SpotifyPlus's schema wrongly says 50.
+    const hass = fakeHass(() => ({ response: { result: { items: [] } } }));
+    const api = new SpotifyApi(hass, 'media_player.spotify');
+
+    for (const bad of [12, 50, 999, 0, -1, NaN, undefined]) {
+        hass.calls.length = 0;
+        await api.getArtistAlbums('artist1', { limit: bad });
+        const sent = hass.calls[0].service_data;
+        assert.equal(hass.calls[0].service, 'get_artist_albums');
+        assert.ok(Number.isInteger(sent.limit)
+            && sent.limit >= 1 && sent.limit <= SpotifyApi.ARTIST_ALBUMS_MAX_LIMIT,
+            `limit ${sent.limit} from input ${String(bad)} exceeds Spotify's cap of 10`);
+    }
+    api.destroy();
+});
+
+test('artist albums keeps offset intact for paging', async () => {
+    const hass = fakeHass(() => ({ response: { result: { items: [] } } }));
+    const api = new SpotifyApi(hass, 'media_player.spotify');
+
+    await api.getArtistAlbums('artist1', { offset: 30 });
+    assert.equal(hass.calls[0].service_data.offset, 30, 'offset must not be clamped');
+
+    hass.calls.length = 0;
+    await api.getArtistAlbums('artist1', { offset: -5 });
+    assert.equal(hass.calls[0].service_data.offset, 0, 'negative offset floors at 0');
+    api.destroy();
+});
+
 test('every search wrapper clamps to the 1..10 SpotifyPlus range', async () => {
     const hass = fakeHass(() => ({ response: { result: { items: [] } } }));
     const api = new SpotifyApi(hass, 'media_player.spotify');

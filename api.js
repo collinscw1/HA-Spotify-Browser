@@ -1216,27 +1216,44 @@ export class SpotifyApi {
     }
 
     /*
-     * --- SEARCH ---
+     * --- PAGING LIMITS ---
      *
-     * Search `limit` is capped at 10, not 50. That is Spotify's own documented
-     * range for GET /v1/search ("Default: 5, Range: 0 - 10"), and SpotifyPlus
-     * mirrors it exactly ("Default is 5, Range is 1 to 10" in services.yaml).
-     * Exceeding it fails the whole call with "Validation error: Invalid limit",
-     * and
-     * `search_all` doesn't accept `limit` at all: it takes `limit_total`, and
-     * passing `limit` fails with "extra keys not allowed @ data['limit']".
+     * Source of truth is Spotify's OpenAPI schema, NOT SpotifyPlus's
+     * services.yaml. The integration's schema is wrong in at least one place:
+     * it documents get_artist_albums as "Range is 1 to 50" when Spotify caps
+     * that endpoint at 10, so following it produced "Validation error: Invalid
+     * limit". Verify against:
+     *   https://developer.spotify.com/reference/web-api/open-api-schema.yaml
      *
-     * Several call sites were passing 12 and 20. Every search now goes through
-     * these wrappers so the clamp is applied in one place and no caller can
-     * reintroduce the bug.
+     * Most endpoints share the QueryLimit component (max 50), but two define
+     * their own inline limit with max 10:
+     *
+     *   GET /search               limit: default 5, minimum 0, maximum 10
+     *   GET /artists/{id}/albums  limit: default 5, minimum 0, maximum 10
+     *
+     * Everything else the card calls (/me/tracks, /me/albums, /me/playlists,
+     * /me/following, /me/player/recently-played, /playlists/{id}/tracks,
+     * /albums/{id}/tracks) is max 50.
+     *
+     * Where the two sources disagree the effective ceiling is the STRICTER of
+     * them: Spotify's because the request ends up there, SpotifyPlus's because
+     * it validates first and rejects before forwarding. `search_all` is a
+     * SpotifyPlus-only quirk — it takes `limit_total` and rejects `limit`
+     * outright ("extra keys not allowed @ data['limit']").
      */
     static SEARCH_MAX_LIMIT = 10;
+    static ARTIST_ALBUMS_MAX_LIMIT = 10;
 
-    /** Clamp any caller-supplied search limit into the accepted range. */
-    static _searchLimit(v, fallback = 10) {
+    /** Clamp a caller-supplied limit into 1..max for the endpoint. */
+    static _clampLimit(v, max, fallback = 10) {
         const n = Math.floor(Number(v));
-        if (!Number.isFinite(n) || n < 1) return Math.min(SpotifyApi.SEARCH_MAX_LIMIT, fallback);
-        return Math.min(SpotifyApi.SEARCH_MAX_LIMIT, n);
+        if (!Number.isFinite(n) || n < 1) return Math.min(max, fallback);
+        return Math.min(max, n);
+    }
+
+    /** Clamp for the two endpoints Spotify caps at 10 (search, artist albums). */
+    static _searchLimit(v, fallback = 10) {
+        return SpotifyApi._clampLimit(v, SpotifyApi.SEARCH_MAX_LIMIT, fallback);
     }
 
     /**
@@ -1249,6 +1266,21 @@ export class SpotifyApi {
             criteria,
             criteria_type: 'album,artist,playlist,track',
             limit_total: SpotifyApi._searchLimit(limitTotal),
+        });
+    }
+
+    /**
+     * An artist's albums. Spotify caps this endpoint's `limit` at 10 — one of
+     * only two that don't use the shared max-50 QueryLimit. SpotifyPlus's own
+     * schema wrongly advertises 50, so callers previously passed 12 and 50 and
+     * the whole call failed with "Validation error: Invalid limit".
+     */
+    async getArtistAlbums(artistId, { limit = 10, offset = 0 } = {}) {
+        if (!this.hass || !artistId) return null;
+        return this.fetchForUser('get_artist_albums', {
+            artist_id: artistId,
+            limit: SpotifyApi._clampLimit(limit, SpotifyApi.ARTIST_ALBUMS_MAX_LIMIT),
+            offset: Math.max(0, Math.floor(Number(offset)) || 0),
         });
     }
 

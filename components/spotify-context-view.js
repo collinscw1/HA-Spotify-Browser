@@ -139,11 +139,7 @@ export class SpotifyContextView extends LitElement {
                 newItems = res?.result?.items || [];
                 total = res?.result?.total || total;
             } else if (type === 'artist-discography') {
-                const res = await this.api.fetchSpotifyPlus('get_artist_albums', {
-                    artist_id: this._contextData.id,
-                    limit: limit,
-                    offset: offset
-                });
+                const res = await this.api.getArtistAlbums(this._contextData.id, { limit, offset });
                 newItems = res?.result?.items || [];
                 total = res?.result?.total || total;
             }
@@ -357,7 +353,7 @@ export class SpotifyContextView extends LitElement {
             } else if (type === 'artist') {
                 // Artist pages load progressively: each promise updates state + cache as it resolves.
                 const artistPromise = this.api.fetchForUser('get_artist', { artist_id: id });
-                const albumsPromise = this.api.fetchSpotifyPlus('get_artist_albums', { artist_id: id, limit: 12 });
+                const albumsPromise = this.api.getArtistAlbums(id);
                 const topTracksPromise = (async () => {
                     try {
                         const artistRes = await artistPromise;
@@ -450,9 +446,9 @@ export class SpotifyContextView extends LitElement {
                     const artistRes = await this.api.fetchSpotifyPlus('get_artist', { artist_id: id });
                     artistName = artistRes?.result?.name || 'Artist';
                 }
-                const limit = 50;
-                const offset = 0;
-                const albumsPromise = this.api.fetchForUser('get_artist_albums', { artist_id: id, limit: limit, offset: offset });
+                // Page size comes from getArtistAlbums (Spotify caps this
+                // endpoint at 10); paging below keys off the returned count.
+                const albumsPromise = this.api.getArtistAlbums(id, { offset: 0 });
                 const albumsRes = await albumsPromise;
                 const items = albumsRes?.result?.items || [];
                 const total = albumsRes?.result?.total || 0;
