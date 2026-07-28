@@ -79,6 +79,67 @@ test('one failing chunk does not discard the chunks that resolved', async () => 
     api.destroy();
 });
 
+test('shrinks the batch when SpotifyPlus rejects it as too large', async () => {
+    // SpotifyPlus enforces a lower ceiling than Spotify's documented 50.
+    const ACCEPTS = 25;
+    const hass = fakeHass((payload) => {
+        const sent = payload.service_data.ids.split(',');
+        if (sent.length > ACCEPTS) {
+            throw Object.assign(new Error('Validation error: Too many uris requested'),
+                { code: 'service_validation_error' });
+        }
+        return echoLiked(payload);
+    });
+    const api = new SpotifyApi(hass, 'media_player.spotify');
+
+    const result = await api.checkTrackFavorites(ids(100));
+
+    assert.equal(Object.keys(result).length, 100, 'every id should still resolve');
+    const sizes = hass.calls.map(c => c.service_data.ids.split(',').length);
+    assert.ok(sizes.every(n => n <= 50), 'never exceeds the documented ceiling');
+    assert.ok(sizes.filter(n => n <= ACCEPTS).length >= 4, 'settles on an accepted size');
+    api.destroy();
+});
+
+test('the reduced batch size is remembered for later calls', async () => {
+    const ACCEPTS = 25;
+    const hass = fakeHass((payload) => {
+        const sent = payload.service_data.ids.split(',');
+        if (sent.length > ACCEPTS) {
+            throw Object.assign(new Error('Validation error: Too many uris requested'),
+                { code: 'service_validation_error' });
+        }
+        return echoLiked(payload);
+    });
+    const api = new SpotifyApi(hass, 'media_player.spotify');
+
+    await api.checkTrackFavorites(ids(60));
+    const rejectionsFirst = hass.calls.length;
+    hass.calls.length = 0;
+
+    await api.checkTrackFavorites(ids(60, 'second'));
+    const sizes = hass.calls.map(c => c.service_data.ids.split(',').length);
+
+    assert.ok(sizes.every(n => n <= ACCEPTS),
+        'second call should start at the learned size, not re-probe the ceiling');
+    assert.ok(rejectionsFirst > sizes.length, 'first call paid the discovery cost');
+    api.destroy();
+});
+
+test('gives up rather than spinning if even the smallest batch is refused', async () => {
+    const hass = fakeHass(() => {
+        throw Object.assign(new Error('Validation error: Too many uris requested'),
+            { code: 'service_validation_error' });
+    });
+    const api = new SpotifyApi(hass, 'media_player.spotify');
+
+    const result = await api.checkTrackFavorites(ids(20));
+
+    assert.equal(result, null);
+    assert.ok(hass.calls.length < 15, `made ${hass.calls.length} calls — should not spin`);
+    api.destroy();
+});
+
 test('returns null only when every chunk fails', async () => {
     const hass = fakeHass(() => { throw new Error('nope'); });
     const api = new SpotifyApi(hass, 'media_player.spotify');

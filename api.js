@@ -38,8 +38,16 @@ export class SpotifyApi {
         'playlist_items_replace',
     ]);
 
-    // Spotify's check-favorites endpoints accept at most 50 ids per call.
+    // Spotify's check-favorites endpoints accept at most 50 ids per call, but
+    // SpotifyPlus enforces its own (undocumented, lower) ceiling and rejects
+    // larger batches with "Validation error: Too many uris requested". Rather
+    // than hard-code a guess, start at Spotify's limit and halve on rejection
+    // until it's accepted — see _checkTrackFavoritesChunk.
     static MAX_FAVORITE_IDS = 50;
+    static MIN_FAVORITE_IDS = 5;
+
+    /** Marker: the batch was refused for being too large, so retry it smaller. */
+    static BATCH_TOO_LARGE = Symbol('batch-too-large');
 
     constructor(hass, entityId, deviceResolver = null, defaultVolumeConfig = null, onNotification = null, onError = null) {
         this.hass = hass;
@@ -1058,26 +1066,46 @@ export class SpotifyApi {
         if (idList.length === 0) return null;
         const single = !Array.isArray(ids) && !String(ids).includes(',');
 
+        // Batch size adapts down on rejection and is remembered for the session,
+        // so a too-large ceiling costs one wasted call rather than one per page.
+        if (!this._favoriteBatchSize) this._favoriteBatchSize = SpotifyApi.MAX_FAVORITE_IDS;
+
         const map = {};
         let resolvedAny = false;
-        for (let i = 0; i < idList.length; i += SpotifyApi.MAX_FAVORITE_IDS) {
-            const chunk = idList.slice(i, i + SpotifyApi.MAX_FAVORITE_IDS);
-            const part = await this._checkTrackFavoritesChunk(chunk);
-            if (!part) continue; // this chunk failed — keep whatever else resolved
-            resolvedAny = true;
-            Object.assign(map, part);
+        let i = 0;
+        while (i < idList.length) {
+            const size = this._favoriteBatchSize;
+            const part = await this._checkTrackFavoritesChunk(idList.slice(i, i + size));
+
+            if (part === SpotifyApi.BATCH_TOO_LARGE) {
+                if (size > SpotifyApi.MIN_FAVORITE_IDS) {
+                    this._favoriteBatchSize = Math.max(
+                        SpotifyApi.MIN_FAVORITE_IDS, Math.floor(size / 2));
+                    debugLog(`[SpotifyAPI] check_track_favorites batch too large — retrying at ${this._favoriteBatchSize}`);
+                    continue; // same slice, smaller batch
+                }
+                i += size; // already minimal; skip this slice rather than spin
+                continue;
+            }
+
+            if (part) { resolvedAny = true; Object.assign(map, part); }
+            i += size;
         }
 
         if (!resolvedAny) return null;
         return single ? (map[idList[0]] === true) : map;
     }
 
-    /** One <=50-id `check_track_favorites` call, normalized to {id: bool}. */
+    /**
+     * One `check_track_favorites` call, normalized to {id: bool}.
+     * Returns BATCH_TOO_LARGE when the batch was refused for its size, null on
+     * any other failure.
+     */
     async _checkTrackFavoritesChunk(idList) {
         try {
             const res = await this.fetchSpotifyPlus('check_track_favorites', {
                 ids: idList.join(',')
-            }, true);
+            }, true, true, true);
 
             let result = res?.result ?? res;
             if (typeof result === 'string') {
@@ -1105,7 +1133,8 @@ export class SpotifyApi {
 
             return map;
         } catch (e) {
-            console.error("Check Track Favorites failed:", e);
+            if (/too many uris/i.test(e?.message || '')) return SpotifyApi.BATCH_TOO_LARGE;
+            if (!e?.shed) this._logFailure('check_track_favorites', e);
             return null;
         }
     }
