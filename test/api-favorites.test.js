@@ -196,9 +196,10 @@ test('returns null only when every chunk fails', async () => {
     api.destroy();
 });
 
-test('search sends an explicit, in-range limit', async () => {
-    // SpotifyPlus rejects the whole call with "Invalid limit" if `limit` is
-    // missing or out of range — passing only limit_total broke search entirely.
+test('search_all uses limit_total, never limit', async () => {
+    // Per SpotifyPlus services.yaml, search_all accepts entity_id, criteria,
+    // criteria_type, market, include_external and limit_total — no `limit`.
+    // Sending `limit` fails with "extra keys not allowed @ data['limit']".
     const hass = fakeHass(() => ({ response: { result: {} } }));
     const api = new SpotifyApi(hass, 'media_player.spotify');
 
@@ -207,22 +208,33 @@ test('search sends an explicit, in-range limit', async () => {
     const sent = hass.calls[0].service_data;
     assert.equal(hass.calls[0].service, 'search_all');
     assert.equal(sent.criteria, 'daft punk');
-    assert.ok(Number.isInteger(sent.limit), 'limit must be sent as an integer');
-    assert.ok(sent.limit >= 1 && sent.limit <= 50, `limit ${sent.limit} out of range`);
-    assert.equal('limit_total' in sent, false, 'limit_total alone is what broke it');
+    assert.equal('limit' in sent, false, 'search_all rejects a `limit` key outright');
+    assert.ok(Number.isInteger(sent.limit_total), 'limit_total must be an integer');
+    assert.ok(sent.limit_total >= 1 && sent.limit_total <= SpotifyApi.SEARCH_MAX_LIMIT);
     api.destroy();
 });
 
-test('search clamps a nonsense limit into range', async () => {
-    const hass = fakeHass(() => ({ response: { result: {} } }));
+test('every search wrapper clamps to the 1..10 SpotifyPlus range', async () => {
+    const hass = fakeHass(() => ({ response: { result: { items: [] } } }));
     const api = new SpotifyApi(hass, 'media_player.spotify');
+    const field = { search_all: 'limit_total' };
 
-    for (const bad of [0, -5, 999, NaN, undefined, 'abc']) {
-        hass.calls.length = 0;
-        await api.searchAll('q', bad);
-        const { limit } = hass.calls[0].service_data;
-        assert.ok(Number.isInteger(limit) && limit >= 1 && limit <= 50,
-            `limit ${limit} from input ${String(bad)} is out of range`);
+    const calls = [
+        ['searchAll', (v) => api.searchAll('q', v)],
+        ['searchTracks', (v) => api.searchTracks('q', v)],
+        ['searchArtists', (v) => api.searchArtists('q', v)],
+        ['searchPlaylists', (v) => api.searchPlaylists('q', v)],
+    ];
+
+    for (const [name, run] of calls) {
+        for (const bad of [0, -5, 12, 20, 999, NaN, undefined, 'abc']) {
+            hass.calls.length = 0;
+            await run(bad);
+            const call = hass.calls[0];
+            const value = call.service_data[field[call.service] || 'limit'];
+            assert.ok(Number.isInteger(value) && value >= 1 && value <= SpotifyApi.SEARCH_MAX_LIMIT,
+                `${name}(${String(bad)}) sent ${value}, outside 1..${SpotifyApi.SEARCH_MAX_LIMIT}`);
+        }
     }
     api.destroy();
 });

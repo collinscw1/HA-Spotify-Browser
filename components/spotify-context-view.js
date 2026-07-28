@@ -362,10 +362,8 @@ export class SpotifyContextView extends LitElement {
                     try {
                         const artistRes = await artistPromise;
                         if (!artistRes?.result?.name) return [];
-                        const searchResult = await this.api.fetchSpotifyPlus('search_tracks', {
-                            criteria: `artist:"${artistRes.result.name}"`,
-                            limit: 12
-                        });
+                        const searchResult = await this.api.searchTracks(
+                            `artist:"${artistRes.result.name}"`);
                         return searchResult?.result?.items || [];
                     } catch (e) { return []; }
                 })();
@@ -400,7 +398,7 @@ export class SpotifyContextView extends LitElement {
                     try {
                         const artistRes = await artistPromise;
                         if (!artistRes?.result?.name) return [];
-                        const res = await this.api.searchPlaylists(artistRes.result.name, 12);
+                        const res = await this.api.searchPlaylists(artistRes.result.name);
                         return res?.result?.items || [];
                     } catch (e) { return []; }
                 })();
@@ -725,10 +723,7 @@ export class SpotifyContextView extends LitElement {
         for (const artist of targetArtists) {
             try {
                 // Search matching artist in Spotify to get Image & ID
-                const res = await this.api.fetchSpotifyPlus('search_artists', {
-                    criteria: artist.name,
-                    limit: 1
-                });
+                const res = await this.api.searchArtists(artist.name, 1);
 
                 if (res?.result?.items?.[0]) {
                     hydrated.push(res.result.items[0]);

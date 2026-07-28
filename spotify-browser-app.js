@@ -1317,10 +1317,7 @@ class SpotifyBrowserApp extends LitElement {
             return;
         }
         try {
-            const res = await this.api.fetchSpotifyPlus('search_artists', {
-                criteria: name,
-                limit: 1
-            });
+            const res = await this.api.searchArtists(name, 1);
             const artist = res?.result?.items?.[0];
             if (artist?.id) {
                 this.router.navigateTo(`artist:${artist.id}`, { title: artist.name });

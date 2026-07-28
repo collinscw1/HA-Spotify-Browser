@@ -1214,31 +1214,62 @@ export class SpotifyApi {
         return TRACK_ART_CACHE.set(trackId, url);
     }
 
-    /**
-     * Multi-type search backing the search page.
+    /*
+     * --- SEARCH ---
      *
-     * `limit` is per result type (Spotify caps it at 50). It must be sent
-     * explicitly and in range: SpotifyPlus validates it and rejects the whole
-     * call with "Validation error: Invalid limit" otherwise — which is what
-     * happened when this passed only `limit_total`, breaking search entirely.
+     * SpotifyPlus's search services cap `limit` at 10 ("Default is 5, Range is
+     * 1 to 10" in services.yaml) — well below Spotify's own ceiling. Exceeding
+     * it fails the whole call with "Validation error: Invalid limit", and
+     * `search_all` doesn't accept `limit` at all: it takes `limit_total`, and
+     * passing `limit` fails with "extra keys not allowed @ data['limit']".
+     *
+     * Several call sites were passing 12 and 20. Every search now goes through
+     * these wrappers so the clamp is applied in one place and no caller can
+     * reintroduce the bug.
      */
-    async searchAll(criteria, limit = 20) {
+    static SEARCH_MAX_LIMIT = 10;
+
+    /** Clamp any caller-supplied search limit into the accepted range. */
+    static _searchLimit(v, fallback = 10) {
+        const n = Math.floor(Number(v));
+        if (!Number.isFinite(n) || n < 1) return Math.min(SpotifyApi.SEARCH_MAX_LIMIT, fallback);
+        return Math.min(SpotifyApi.SEARCH_MAX_LIMIT, n);
+    }
+
+    /**
+     * Multi-type search backing the search page. Note this takes `limit_total`
+     * (per criteria type), NOT `limit` — see the block comment above.
+     */
+    async searchAll(criteria, limitTotal = 10) {
         if (!this.hass || !criteria) return null;
-        const perType = Math.min(50, Math.max(1, Math.floor(Number(limit)) || 20));
         return this.fetchForUser('search_all', {
             criteria,
             criteria_type: 'album,artist,playlist,track',
-            limit: perType,
+            limit_total: SpotifyApi._searchLimit(limitTotal),
+        });
+    }
+
+    async searchTracks(criteria, limit = 10) {
+        if (!this.hass || !criteria) return null;
+        return this.fetchSpotifyPlus('search_tracks', {
+            criteria,
+            limit: SpotifyApi._searchLimit(limit),
+        });
+    }
+
+    async searchArtists(criteria, limit = 10) {
+        if (!this.hass || !criteria) return null;
+        return this.fetchSpotifyPlus('search_artists', {
+            criteria,
+            limit: SpotifyApi._searchLimit(limit),
         });
     }
 
     async searchPlaylists(query, limit = 10, offset = 0) {
         if (!this.hass || !query) return { result: { items: [] } };
-
-        // Use 'search_playlists' service
         return await this.fetchSpotifyPlus('search_playlists', {
             criteria: query,
-            limit: limit,
+            limit: SpotifyApi._searchLimit(limit),
             offset: offset
         });
     }
