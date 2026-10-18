@@ -296,9 +296,18 @@ export class SpotifyArtistView extends LitElement {
         const trackIds = this.data.topTracks.map(t => t.id || t.track?.id).filter(Boolean);
         if (trackIds.length === 0) return;
 
+        // An artist page resolves in stages (albums, top tracks, playlists,
+        // similar artists), reassigning `data` — and re-running this — once per
+        // stage. Only ask again when the track set actually changed.
+        const key = trackIds.join(',');
+        if (this._likesKey === key) return;
+        this._likesKey = key;
+
         const results = await this.api.checkTrackFavorites(trackIds);
         if (results) {
             this._trackLikes = { ...this._trackLikes, ...results };
+        } else {
+            this._likesKey = null; // unresolved — let a later pass retry
         }
     }
 
@@ -633,4 +642,4 @@ export class SpotifyArtistView extends LitElement {
     }
 }
 
-customElements.define('spotify-artist-view', SpotifyArtistView);
+if (!customElements.get('spotify-artist-view')) customElements.define('spotify-artist-view', SpotifyArtistView);

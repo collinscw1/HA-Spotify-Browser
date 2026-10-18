@@ -1,4 +1,33 @@
 import { debugLog, playlistSortParams } from './utils.js';
+import { RequestGovernor } from './request-governor.js';
+import { MetadataCache } from './metadata-cache.js';
+
+/*
+ * Immutable-metadata caches, shared across every instance and persisted across
+ * page loads. Album art and artist genres never change for a given id, so
+ * re-fetching them per session spends the Spotify developer app's finite
+ * request quota for nothing — and exhausting that quota is what makes every
+ * call appear to hang (SpotifyPlus sleeps on the 429's multi-hour Retry-After).
+ */
+const TRACK_ART_CACHE = new MetadataCache('track-art', { maxEntries: 1000 });
+const ARTIST_GENRE_CACHE = new MetadataCache('artist-genres', { maxEntries: 500 });
+
+/*
+ * Limits discovered by probing, rather than metadata. SpotifyPlus's accepted
+ * batch sizes are undocumented and version-dependent, so the card learns them
+ * by being refused once — and persisting that means paying the rejected call
+ * once per device, instead of once per page load.
+ */
+const API_LIMITS_CACHE = new MetadataCache('api-limits', { maxEntries: 20 });
+
+/**
+ * Forget probed API limits, so the next call re-discovers them. Useful if a
+ * SpotifyPlus upgrade raises a ceiling, and required by tests (the cache is
+ * module-level and would otherwise leak between them).
+ */
+export function resetLearnedApiLimits() {
+    API_LIMITS_CACHE.clear();
+}
 
 export class SpotifyApi {
     // Only these (user-initiated playback) services should surface a validation
@@ -11,6 +40,32 @@ export class SpotifyApi {
         'player_transfer_playback',
         'add_player_queue_items'
     ]);
+
+    // Calls a person just triggered. These jump the governor's queue ahead of
+    // background enrichment and are allowed to probe an open circuit breaker,
+    // so pressing play still works the moment the socket comes back. Everything
+    // else (get_*, check_*, search_*) is background work that may be shed.
+    static USER_SERVICES = new Set([
+        ...this.PLAYBACK_SERVICES,
+        'playlist_create',
+        'playlist_change',
+        'playlist_items_add',
+        'playlist_items_remove',
+        'playlist_items_reorder',
+        'playlist_items_replace',
+    ]);
+
+    // SpotifyPlus's services.yaml is explicit for every check/save/remove/follow
+    // service: "A maximum of 40 id's may be specified." (Spotify's own
+    // check-saved-tracks endpoint allows 50; the integration is stricter.)
+    // Exceeding it fails the call with "Validation error: Too many uris
+    // requested", so start at the documented ceiling — the adaptive halving in
+    // checkTrackFavorites remains as a safety net for other builds.
+    static MAX_FAVORITE_IDS = 40;
+    static MIN_FAVORITE_IDS = 5;
+
+    /** Marker: the batch was refused for being too large, so retry it smaller. */
+    static BATCH_TOO_LARGE = Symbol('batch-too-large');
 
     constructor(hass, entityId, deviceResolver = null, defaultVolumeConfig = null, onNotification = null, onError = null) {
         this.hass = hass;
@@ -51,6 +106,79 @@ export class SpotifyApi {
         this._onSocketReady = () => { this._socketReady = true; this._resumedAt = Date.now(); };
         this._onSocketDisconnected = () => { this._socketReady = false; };
         this._bindConnection();
+
+        // Everything below rides the shared HA WebSocket, so nothing reaches it
+        // except through the governor: bounded concurrency, a bounded queue, and
+        // a breaker that fails fast instead of hammering a dead connection.
+        // See request-governor.js for why this exists.
+        this._governor = new RequestGovernor({
+            canSend: () => this._connectionUp,
+            onStateChange: (s) => this._onGovernorState(s),
+        });
+
+        // Failure-log throttling: a burst used to emit one multi-line
+        // console.warn per call, which is its own performance problem.
+        this._logState = new Map(); // service -> { at, suppressed }
+    }
+
+    /**
+     * Breaker transitions. Opening is worth telling the user about once — it
+     * means the card has stopped talking to Home Assistant for a while — but
+     * only for a real stall, not a single blip, and never repeatedly.
+     */
+    _onGovernorState(s) {
+        if (s.state === 'open') {
+            debugLog(`[SpotifyAPI] Backing off for ${Math.round(s.openFor / 1000)}s after repeated failures`, s);
+            const now = Date.now();
+            const quiet = now - (this._lastBackoffNotice || 0) < 60000;
+
+            if (s.stalled && !quiet) {
+                // Calls are being accepted and never answered while Home
+                // Assistant itself is fine. In practice that means SpotifyPlus
+                // is blocked upstream — most often the Spotify developer app's
+                // request quota, which it waits out silently for hours.
+                this._lastBackoffNotice = now;
+                console.warn(
+                    '[SpotifyAPI] SpotifyPlus is accepting requests but never answering them, ' +
+                    'while Home Assistant is responsive. This usually means the Spotify developer ' +
+                    'app has exceeded its request quota (HTTP 429 / QUOTA_EXCEEDED), which the ' +
+                    'integration waits out silently. Check the Spotify developer dashboard. ' +
+                    `Pausing requests for ${Math.round(s.openFor / 60000)} minutes.`
+                );
+                this._notify("Spotify isn't responding — it may have hit its request limit.");
+            } else if (s.transport && !quiet) {
+                this._lastBackoffNotice = now;
+                this._notify("Lost contact with Home Assistant — pausing Spotify updates.");
+            }
+        } else if (s.state === 'closed') {
+            debugLog('[SpotifyAPI] Connection recovered, resuming normal requests');
+        }
+    }
+
+    /** Clear an open/stalled breaker on explicit user request ("Retry"). */
+    resume() {
+        this._lastBackoffNotice = 0;
+        this._governor.resume();
+    }
+
+    /** Log a failed call at most once per service per 5s, tallying the rest. */
+    _logFailure(service, e) {
+        const now = Date.now();
+        const prev = this._logState.get(service) || { at: 0, suppressed: 0 };
+        if (now - prev.at < 5000) {
+            this._logState.set(service, { at: prev.at, suppressed: prev.suppressed + 1 });
+            return;
+        }
+        const also = prev.suppressed ? ` (+${prev.suppressed} more suppressed)` : '';
+        // HA nests websocket failures under `error`; plain throws carry .message.
+        const detail = e?.message || e?.error?.message || e?.code || e?.error?.code || e;
+        console.warn(`[SpotifyAPI] Failed Call [${service}]${also}:`, detail);
+        this._logState.set(service, { at: now, suppressed: 0 });
+    }
+
+    /** Governor diagnostics (in-flight/queued/breaker state). */
+    get governorStats() {
+        return this._governor.stats;
     }
 
     /** (Re)subscribe to the active HA connection's ready/disconnected events. */
@@ -146,6 +274,7 @@ export class SpotifyApi {
         clearTimeout(this._readyScanTimer);
         this._readyScanTimer = null;
         this._readyScanPromise = null;
+        this._governor.destroy();
     }
 
     /**
@@ -184,7 +313,7 @@ export class SpotifyApi {
      * queue order matches the list — then jumps to the tapped position once the
      * progressive load reaches it. Returns true when playback started.
      */
-    async _playSonosLocal(sonosEntity, uri, offsetPosition, offsetUri) {
+    async _playSonosLocal(sonosEntity, uri, offsetPosition, offsetUri, favoritesDevice = null) {
         if (!sonosEntity) return false;
         const isCollection = typeof uri === 'string' && uri.endsWith(':collection');
         if (isCollection) {
@@ -195,8 +324,10 @@ export class SpotifyApi {
                 if (ok) this.triggerScan();
                 return ok;
             }
+            // favoritesDevice names the speaker when SpotifyPlus may be idle
+            // (a sonos-card handoff); otherwise the active device is used.
             const res = await this.fetchSpotifyPlus('player_media_play_track_favorites',
-                { shuffle: false }, false);
+                { shuffle: false, ...(favoritesDevice && { device_id: favoritesDevice }) }, false);
             if (!res) return false;
             if (offsetPosition != null && offsetPosition > 0) {
                 // Favorites load at roughly 5 tracks/sec on the Sonos path; allow
@@ -215,7 +346,16 @@ export class SpotifyApi {
         return ok;
     }
 
-    async fetchSpotifyPlus(service, params = {}, expectResponse = true, logError = true, throwOnError = false) {
+    /**
+     * A read the user is actively waiting on — page navigation, not background
+     * enrichment. Jumps the governor's queue and may probe an open breaker, so
+     * opening an album still works while background artwork lookups are failing.
+     */
+    fetchForUser(service, params = {}, expectResponse = true) {
+        return this.fetchSpotifyPlus(service, params, expectResponse, true, false, { priority: 'user' });
+    }
+
+    async fetchSpotifyPlus(service, params = {}, expectResponse = true, logError = true, throwOnError = false, opts = {}) {
         if (!this.hass) return null;
 
         // --- FIX: MAP STANDARD CONTROLS TO MEDIA_PLAYER DOMAIN ---
@@ -288,7 +428,11 @@ export class SpotifyApi {
 
             if (expectResponse) payload.return_response = true;
 
-            const response = await this.hass.callWS(payload);
+            const response = await this._governor.run(() => this.hass.callWS(payload), {
+                priority: opts.priority
+                    || (SpotifyApi.USER_SERVICES.has(service) ? 'user' : 'background'),
+                label: service,
+            });
 
             // Transfers get no rescan from SpotifyPlus on their own, and restricted
             // Connect devices (Google Cast) are slow to appear in the Web API — so
@@ -301,6 +445,15 @@ export class SpotifyApi {
             return response;
 
         } catch (e) {
+            // Shed by the governor: this never reached Home Assistant, so it is
+            // not evidence that anything is wrong with the user's setup. Don't
+            // pop the device picker or shout about it — just fail quietly.
+            if (e?.shed) {
+                debugLog(`[SpotifyAPI] Skipped [${service}] — ${e.reason}`);
+                if (throwOnError) throw e;
+                return null;
+            }
+
             // Report major errors via callback — but ONLY for playback actions.
             // A background read (get_player_queue_info, get_*, etc.) failing
             // validation must NOT pop the "select a device" picker; that should
@@ -314,9 +467,7 @@ export class SpotifyApi {
 
             if (throwOnError) throw e;
 
-            if (logError) {
-                console.warn(`[SpotifyAPI] Failed Call [${service}]:`, JSON.stringify(e, null, 2));
-            }
+            if (logError) this._logFailure(service, e);
             return null;
         }
     }
@@ -405,11 +556,21 @@ export class SpotifyApi {
         // Active = playing, paused, or buffering. Idle/Off is not active.
         const isActive = stateObj && ['playing', 'paused', 'buffering'].includes(stateObj.state);
 
+        // A speaker handed over by the sonos-card CTA overrides everything
+        // below: no resolver (so no device picker), and it wins even when
+        // SpotifyPlus reports a different active device.
+        const handoff = !specificDevice ? this.sonosBridge?.handoffTarget : null;
+
         // 1. Determine Device Strategy
         let deviceToUse = null;
         let resolvedDeviceObj = null; // The full resolved device object (for brand/Sonos detection)
 
-        if (specificDevice) {
+        if (handoff) {
+            // Only the SpotifyPlus fallback uses this (content the local Sonos
+            // path can't launch, e.g. artists); local launches use the entity.
+            deviceToUse = this.sonosBridge.spotifyDeviceFor(handoff);
+            this.sonosBridge.log(`playMedia: handoff target ${handoff} (fallback device "${deviceToUse}") — skipping device resolution`);
+        } else if (specificDevice) {
             deviceToUse = specificDevice;
         } else {
             if (!isActive) {
@@ -442,13 +603,13 @@ export class SpotifyApi {
         // target so context jumps pick the right parameter. For the active device
         // we read brand off the entity attributes; for an idle launch we read it
         // off the resolved device object.
-        const isSonosTarget = !!this.sonosBridge && this.sonosBridge.isSonosTarget(
+        const isSonosTarget = !!handoff || (!!this.sonosBridge && this.sonosBridge.isSonosTarget(
             resolvedDeviceObj,
             isActive ? (stateObj?.attributes || {}) : {}
-        );
+        ));
         let sonosEntity = null;
         if (isSonosTarget) {
-            sonosEntity = this.sonosBridge.resolveSonosEntity(
+            sonosEntity = handoff || this.sonosBridge.resolveSonosEntity(
                 resolvedDeviceObj, isActive ? (stateObj?.attributes || {}) : {});
             // Remember the target before any volume/transport call below: a local
             // launch never engages Spotify Connect, so this memory is the only
@@ -464,7 +625,9 @@ export class SpotifyApi {
         // dynamically). Runs after Sonos detection so the volume_set routes to
         // the Sonos speaker on a Sonos launch, not the idle SpotifyPlus entity
         // (which rejects it with "no active Spotify player device").
-        if (!specificDevice && !isActive) {
+        // Not on a handoff: the volume was already chosen on the sonos-card,
+        // and on a group it would only reach the coordinator.
+        if (!specificDevice && !isActive && !handoff) {
             const vol = this._resolveDefaultVolume();
             if (vol !== null) {
                 const launchDeviceId = resolvedDeviceObj?.id || (typeof deviceToUse === 'string' ? deviceToUse : null);
@@ -489,7 +652,8 @@ export class SpotifyApi {
                     // drive the HA Sonos entity directly. Falls through to the
                     // SpotifyPlus (cloud / elevated-token) path on any failure.
                     if (isSonosTarget && this._sonosLaunchLocal()) {
-                        const played = await this._playSonosLocal(sonosEntity, uri, offset_position, offset_uri);
+                        const played = await this._playSonosLocal(sonosEntity, uri, offset_position, offset_uri,
+                            handoff ? deviceIdToTry : null);
                         if (played) return { success: true };
                     }
 
@@ -526,6 +690,13 @@ export class SpotifyApi {
                 }
                 else {
                     // C. Tracks / Fallback
+                    // Handoff single track: straight onto the speaker, like a
+                    // context launch, rather than via SpotifyPlus by name.
+                    if (handoff && !Array.isArray(uri) && this._sonosLaunchLocal()
+                        && await this.sonosBridge.playTrack(sonosEntity, uri)) {
+                        this.triggerScan();
+                        return { success: true };
+                    }
                     if (deviceIdToTry || Array.isArray(uri)) {
                         const uriArray = Array.isArray(uri) ? uri : [uri];
                         params.uris = uriArray.join(',');
@@ -562,7 +733,7 @@ export class SpotifyApi {
         // --- EXECUTE PLAYBACK ---
         const result = await executePlay(deviceToUse);
 
-        if (!specificDevice && !isActive && result.success === false && deviceToUse) {
+        if (!specificDevice && (!isActive || handoff) && result.success === false && deviceToUse) {
             this._notify(`Playback Failed on ${deviceToUse}`);
         }
 
@@ -917,14 +1088,72 @@ export class SpotifyApi {
         }
     }
 
+    /**
+     * Liked-state for one or many track ids. Single id -> boolean; multiple ->
+     * an {id: bool} map. Returns null only when nothing could be resolved.
+     *
+     * Callers hand this whole track lists (a playlist view checks every visible
+     * row), so the 50-id ceiling is enforced here rather than at each call site
+     * — exceeding it made SpotifyPlus reject the call with "Too many uris
+     * requested", and a paging view would repeat that failure once per page.
+     * Chunks run sequentially and a failed chunk is skipped, not retried.
+     */
     async checkTrackFavorites(ids) {
         if (!this.hass || !ids) return null;
+
+        const raw = Array.isArray(ids) ? ids : String(ids).split(',');
+        const idList = raw.map(id => String(id).trim()).filter(Boolean);
+        if (idList.length === 0) return null;
+        const single = !Array.isArray(ids) && !String(ids).includes(',');
+
+        // Batch size adapts down on rejection and is remembered across sessions,
+        // so discovering the ceiling costs one refused call per device rather
+        // than one per page load. Clamped in case of a stale/garbage entry.
+        if (!this._favoriteBatchSize) {
+            const learned = Number(API_LIMITS_CACHE.get('favorite-batch'));
+            this._favoriteBatchSize = Number.isFinite(learned) && learned > 0
+                ? Math.min(SpotifyApi.MAX_FAVORITE_IDS,
+                    Math.max(SpotifyApi.MIN_FAVORITE_IDS, Math.floor(learned)))
+                : SpotifyApi.MAX_FAVORITE_IDS;
+        }
+
+        const map = {};
+        let resolvedAny = false;
+        let i = 0;
+        while (i < idList.length) {
+            const size = this._favoriteBatchSize;
+            const part = await this._checkTrackFavoritesChunk(idList.slice(i, i + size));
+
+            if (part === SpotifyApi.BATCH_TOO_LARGE) {
+                if (size > SpotifyApi.MIN_FAVORITE_IDS) {
+                    this._favoriteBatchSize = Math.max(
+                        SpotifyApi.MIN_FAVORITE_IDS, Math.floor(size / 2));
+                    API_LIMITS_CACHE.set('favorite-batch', this._favoriteBatchSize);
+                    debugLog(`[SpotifyAPI] check_track_favorites batch too large — retrying at ${this._favoriteBatchSize}`);
+                    continue; // same slice, smaller batch
+                }
+                i += size; // already minimal; skip this slice rather than spin
+                continue;
+            }
+
+            if (part) { resolvedAny = true; Object.assign(map, part); }
+            i += size;
+        }
+
+        if (!resolvedAny) return null;
+        return single ? (map[idList[0]] === true) : map;
+    }
+
+    /**
+     * One `check_track_favorites` call, normalized to {id: bool}.
+     * Returns BATCH_TOO_LARGE when the batch was refused for its size, null on
+     * any other failure.
+     */
+    async _checkTrackFavoritesChunk(idList) {
         try {
-            const idList = Array.isArray(ids) ? ids.slice() : String(ids).split(',');
-            const idsParam = idList.join(',');
             const res = await this.fetchSpotifyPlus('check_track_favorites', {
-                ids: idsParam
-            }, true);
+                ids: idList.join(',')
+            }, true, true, true);
 
             let result = res?.result ?? res;
             if (typeof result === 'string') {
@@ -950,11 +1179,10 @@ export class SpotifyApi {
                 map[idList[0]] = result;
             }
 
-            // Single id -> boolean; multiple -> the {id: bool} map.
-            const single = !Array.isArray(ids) && !idsParam.includes(',');
-            return single ? (map[idList[0]] === true) : map;
+            return map;
         } catch (e) {
-            console.error("Check Track Favorites failed:", e);
+            if (/too many uris/i.test(e?.message || '')) return SpotifyApi.BATCH_TOO_LARGE;
+            if (!e?.shed) this._logFailure('check_track_favorites', e);
             return null;
         }
     }
@@ -976,15 +1204,16 @@ export class SpotifyApi {
     // genres (may be empty). Used to build the Liked Songs filter pills.
     async getArtistGenres(artistId) {
         if (!this.hass || !artistId) return [];
-        if (!this._artistGenreCache) this._artistGenreCache = new Map();
-        if (this._artistGenreCache.has(artistId)) return this._artistGenreCache.get(artistId);
-        let genres = [];
-        try {
-            const res = await this.fetchSpotifyPlus('get_artist', { artist_id: artistId });
-            genres = res?.result?.genres || res?.genres || [];
-        } catch (e) { genres = []; }
-        this._artistGenreCache.set(artistId, genres);
-        return genres;
+        if (ARTIST_GENRE_CACHE.has(artistId)) return ARTIST_GENRE_CACHE.get(artistId);
+
+        const res = await this.fetchSpotifyPlus('get_artist', { artist_id: artistId });
+        // Only cache a call that answered. A failed, timed-out or shed request
+        // says nothing about the artist, and caching [] would hide their genres
+        // for good (the cache is durable now — a bad entry outlives the reload).
+        if (!res) return [];
+
+        const genres = res.result?.genres || res.genres || [];
+        return ARTIST_GENRE_CACHE.set(artistId, genres);
     }
 
     /**
@@ -994,25 +1223,110 @@ export class SpotifyApi {
      */
     async getTrackArt(trackId) {
         if (!this.hass || !trackId) return null;
-        if (!this._trackArtCache) this._trackArtCache = new Map();
-        if (this._trackArtCache.has(trackId)) return this._trackArtCache.get(trackId);
-        let url = null;
-        try {
-            const res = await this.fetchSpotifyPlus('get_track', { track_id: trackId });
-            const track = res?.result || res;
-            url = track?.album?.images?.[0]?.url || null;
-        } catch (e) { url = null; }
-        this._trackArtCache.set(trackId, url);
-        return url;
+        if (TRACK_ART_CACHE.has(trackId)) return TRACK_ART_CACHE.get(trackId);
+
+        const res = await this.fetchSpotifyPlus('get_track', { track_id: trackId });
+        // Only a call that actually answered may populate the cache. A failed,
+        // timed-out or shed call is not evidence that the track has no artwork —
+        // and since this cache is durable, a bad entry would blank that track
+        // across reloads, not just for the session.
+        if (!res) return null;
+
+        const track = res.result || res;
+        const url = track?.album?.images?.[0]?.url || null;
+        return TRACK_ART_CACHE.set(trackId, url);
+    }
+
+    /*
+     * --- PAGING LIMITS ---
+     *
+     * Source of truth is Spotify's OpenAPI schema, NOT SpotifyPlus's
+     * services.yaml. The integration's schema is wrong in at least one place:
+     * it documents get_artist_albums as "Range is 1 to 50" when Spotify caps
+     * that endpoint at 10, so following it produced "Validation error: Invalid
+     * limit". Verify against:
+     *   https://developer.spotify.com/reference/web-api/open-api-schema.yaml
+     *
+     * Most endpoints share the QueryLimit component (max 50), but two define
+     * their own inline limit with max 10:
+     *
+     *   GET /search               limit: default 5, minimum 0, maximum 10
+     *   GET /artists/{id}/albums  limit: default 5, minimum 0, maximum 10
+     *
+     * Everything else the card calls (/me/tracks, /me/albums, /me/playlists,
+     * /me/following, /me/player/recently-played, /playlists/{id}/tracks,
+     * /albums/{id}/tracks) is max 50.
+     *
+     * Where the two sources disagree the effective ceiling is the STRICTER of
+     * them: Spotify's because the request ends up there, SpotifyPlus's because
+     * it validates first and rejects before forwarding. `search_all` is a
+     * SpotifyPlus-only quirk — it takes `limit_total` and rejects `limit`
+     * outright ("extra keys not allowed @ data['limit']").
+     */
+    static SEARCH_MAX_LIMIT = 10;
+    static ARTIST_ALBUMS_MAX_LIMIT = 10;
+
+    /** Clamp a caller-supplied limit into 1..max for the endpoint. */
+    static _clampLimit(v, max, fallback = 10) {
+        const n = Math.floor(Number(v));
+        if (!Number.isFinite(n) || n < 1) return Math.min(max, fallback);
+        return Math.min(max, n);
+    }
+
+    /** Clamp for the two endpoints Spotify caps at 10 (search, artist albums). */
+    static _searchLimit(v, fallback = 10) {
+        return SpotifyApi._clampLimit(v, SpotifyApi.SEARCH_MAX_LIMIT, fallback);
+    }
+
+    /**
+     * Multi-type search backing the search page. Note this takes `limit_total`
+     * (per criteria type), NOT `limit` — see the block comment above.
+     */
+    async searchAll(criteria, limitTotal = 10) {
+        if (!this.hass || !criteria) return null;
+        return this.fetchForUser('search_all', {
+            criteria,
+            criteria_type: 'album,artist,playlist,track',
+            limit_total: SpotifyApi._searchLimit(limitTotal),
+        });
+    }
+
+    /**
+     * An artist's albums. Spotify caps this endpoint's `limit` at 10 — one of
+     * only two that don't use the shared max-50 QueryLimit. SpotifyPlus's own
+     * schema wrongly advertises 50, so callers previously passed 12 and 50 and
+     * the whole call failed with "Validation error: Invalid limit".
+     */
+    async getArtistAlbums(artistId, { limit = 10, offset = 0 } = {}) {
+        if (!this.hass || !artistId) return null;
+        return this.fetchForUser('get_artist_albums', {
+            artist_id: artistId,
+            limit: SpotifyApi._clampLimit(limit, SpotifyApi.ARTIST_ALBUMS_MAX_LIMIT),
+            offset: Math.max(0, Math.floor(Number(offset)) || 0),
+        });
+    }
+
+    async searchTracks(criteria, limit = 10) {
+        if (!this.hass || !criteria) return null;
+        return this.fetchSpotifyPlus('search_tracks', {
+            criteria,
+            limit: SpotifyApi._searchLimit(limit),
+        });
+    }
+
+    async searchArtists(criteria, limit = 10) {
+        if (!this.hass || !criteria) return null;
+        return this.fetchSpotifyPlus('search_artists', {
+            criteria,
+            limit: SpotifyApi._searchLimit(limit),
+        });
     }
 
     async searchPlaylists(query, limit = 10, offset = 0) {
         if (!this.hass || !query) return { result: { items: [] } };
-
-        // Use 'search_playlists' service
         return await this.fetchSpotifyPlus('search_playlists', {
             criteria: query,
-            limit: limit,
+            limit: SpotifyApi._searchLimit(limit),
             offset: offset
         });
     }

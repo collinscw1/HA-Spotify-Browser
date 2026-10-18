@@ -444,4 +444,4 @@ export class SpotifyPlaylistPicker extends LitElement {
     }
 }
 
-customElements.define('spotify-playlist-picker', SpotifyPlaylistPicker);
+if (!customElements.get('spotify-playlist-picker')) customElements.define('spotify-playlist-picker', SpotifyPlaylistPicker);

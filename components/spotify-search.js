@@ -220,11 +220,7 @@ class SpotifySearch extends LitElement {
         if (!query) return;
         const searchId = (this._searchId = (this._searchId || 0) + 1);
         try {
-            const res = await this.api.fetchSpotifyPlus('search_all', {
-                criteria: query,
-                criteria_type: 'album,artist,playlist,track',
-                limit_total: 20
-            });
+            const res = await this.api.searchAll(query);
             if (searchId !== this._searchId) return;
             if (res && res.result) {
                 this._results = res.result;
@@ -452,4 +448,4 @@ class SpotifySearch extends LitElement {
     }
 }
 
-customElements.define('spotify-search', SpotifySearch);
+if (!customElements.get('spotify-search')) customElements.define('spotify-search', SpotifySearch);

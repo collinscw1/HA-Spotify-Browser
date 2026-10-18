@@ -617,4 +617,4 @@ export class SpotifyNowPlayingMobile extends LitElement {
     }
 }
 
-customElements.define('spotify-now-playing-mobile', SpotifyNowPlayingMobile);
+if (!customElements.get('spotify-now-playing-mobile')) customElements.define('spotify-now-playing-mobile', SpotifyNowPlayingMobile);

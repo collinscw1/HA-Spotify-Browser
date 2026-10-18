@@ -222,4 +222,4 @@ export class SpotifySidebarPlayer extends LitElement {
     }
 }
 
-customElements.define('spotify-sidebar-player', SpotifySidebarPlayer);
+if (!customElements.get('spotify-sidebar-player')) customElements.define('spotify-sidebar-player', SpotifySidebarPlayer);

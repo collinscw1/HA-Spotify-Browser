@@ -207,4 +207,4 @@ export class SpotifyDevicePickerLarge extends LitElement {
     }
 }
 
-customElements.define('spotify-popup-devices', SpotifyDevicePickerLarge);
+if (!customElements.get('spotify-popup-devices')) customElements.define('spotify-popup-devices', SpotifyDevicePickerLarge);

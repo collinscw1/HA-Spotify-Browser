@@ -284,4 +284,4 @@ export class SpotifyConnectPanel extends LitElement {
     }
 }
 
-customElements.define('spotify-connect-panel', SpotifyConnectPanel);
+if (!customElements.get('spotify-connect-panel')) customElements.define('spotify-connect-panel', SpotifyConnectPanel);

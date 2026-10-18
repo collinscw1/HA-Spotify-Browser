@@ -1,4 +1,4 @@
-import { parseSpotifyUri, spotifyUriFromContentId, extrapolatedPosition } from '../../utils.js';
+import { parseSpotifyUri, spotifyUriFromContentId, extrapolatedPosition, mapLimit } from '../../utils.js';
 
 export class PlayerController extends EventTarget {
     constructor(api) {
@@ -418,18 +418,35 @@ export class PlayerController extends EventTarget {
     /**
      * Fill in album art for the upcoming Sonos queue (capped) via SpotifyPlus
      * get_track, then re-dispatch. Bails if a newer refresh has superseded it.
+     *
+     * Rate-limited: this used to fire one `get_track` per queue entry all at
+     * once, on every queue refresh — i.e. once per track change — which is a
+     * burst of up to 30 calls onto the shared HA WebSocket for artwork nobody
+     * has scrolled to yet.
      */
-    async _enrichSonosArt(fetchId, cap = 30) {
+    async _enrichSonosArt(fetchId, cap = 12) {
         if (!this.api?.getTrackArt) return;
+        // Never spend a struggling connection on decoration. Without this the
+        // artwork pass keeps failing, trips the breaker, and the user's next
+        // page load gets shed by a backoff that queue thumbnails caused.
+        if (this.api.governorStats?.open) return;
         const slice = (this.state.queue || []).slice(0, cap);
         const needs = slice.filter(t => t?.id && !(t.album?.images?.length));
         if (!needs.length) return;
 
         let changed = false;
-        await Promise.all(needs.map(async (t) => {
+        let misses = 0;
+        await mapLimit(needs, 2, async (t) => {
+            if (fetchId !== this._queueFetchId) return; // superseded mid-flight
+            // Give up on the whole pass once lookups start failing. This is the
+            // lowest-value work the card does — artwork for queue rows nobody
+            // has scrolled to — and on a long Sonos queue it would otherwise
+            // burn every request slot while the user waits on a page load.
+            if (misses >= 2) return;
             const url = await this.api.getTrackArt(t.id);
             if (url) { t.album = { ...(t.album || {}), images: [{ url }] }; changed = true; }
-        }));
+            else misses++;
+        });
 
         if (!changed || fetchId !== this._queueFetchId) return;
         this.state = { ...this.state, queue: [...this.state.queue] };

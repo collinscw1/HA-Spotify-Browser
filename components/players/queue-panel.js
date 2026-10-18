@@ -217,4 +217,4 @@ export class SpotifyQueuePanel extends LitElement {
     }
 }
 
-customElements.define('spotify-queue-panel', SpotifyQueuePanel);
+if (!customElements.get('spotify-queue-panel')) customElements.define('spotify-queue-panel', SpotifyQueuePanel);

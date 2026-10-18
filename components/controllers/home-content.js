@@ -1,3 +1,5 @@
+import { mapLimit } from '../../utils.js';
+
 /**
  * Builds the "Made For You" item list from the home.made_for_you config.
  * Shared by the home screen carousel and the "See All" section view.
@@ -39,24 +41,23 @@ export async function loadMadeForYouItems(api, config) {
             });
         }
         else if (entry.playlists_recommended && Array.isArray(entry.playlists_recommended)) {
-            const mfyPromises = entry.playlists_recommended.map(async (mfy) => {
-                try {
-                    const res = await api.fetchSpotifyPlus('get_playlist_cover_image', { playlist_id: mfy.id });
-                    const imgUrl = (res && res.result && res.result.url) ? res.result.url : '';
-                    return {
-                        id: mfy.id, type: 'playlist-recommended', name: mfy.title,
-                        uri: `spotify:playlist:${mfy.id}`,
-                        images: [{ url: imgUrl }],
-                        owner: { display_name: 'Spotify' }
-                    };
-                } catch (e) { return null; }
+            // Rate-limited: a long made_for_you list would otherwise put one
+            // call per entry on the shared HA WebSocket simultaneously.
+            const results = await mapLimit(entry.playlists_recommended, 4, async (mfy) => {
+                const res = await api.fetchSpotifyPlus('get_playlist_cover_image', { playlist_id: mfy.id });
+                const imgUrl = (res && res.result && res.result.url) ? res.result.url : '';
+                return {
+                    id: mfy.id, type: 'playlist-recommended', name: mfy.title,
+                    uri: `spotify:playlist:${mfy.id}`,
+                    images: [{ url: imgUrl }],
+                    owner: { display_name: 'Spotify' }
+                };
             });
-            const results = await Promise.all(mfyPromises);
             items.push(...results.filter(Boolean));
         }
         else if (entry.playlists && Array.isArray(entry.playlists)) {
-            const plPromises = entry.playlists.map(id => api.fetchSpotifyPlus('get_playlist', { playlist_id: id }));
-            const results = await Promise.all(plPromises);
+            const results = await mapLimit(entry.playlists, 4,
+                id => api.fetchSpotifyPlus('get_playlist', { playlist_id: id }));
             items.push(...results.filter(res => res && res.result).map(res => res.result));
         }
         else if (typeof entry === 'string') {

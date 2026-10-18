@@ -116,6 +116,16 @@ const bool = (v) => v === true;
 const num = (def) => (v) => (Number.isFinite(Number(v)) ? Number(v) : def);
 const str = (v) => (v === null || v === undefined ? null : String(v));
 
+/**
+ * Three-state flag: true / false / null-for-omitted. `bool` collapses an
+ * omitted key to `false`, which is fine for a toggle but not where an explicit
+ * `false` has to mean something stronger than "unset" — see
+ * `sonos.device_map[].is_sonos`, where `false` authoritatively marks a device
+ * as NOT Sonos and must not be confused with a user who simply didn't say.
+ * (listOf defaults an omitted field to null for any coercer that isn't `bool`.)
+ */
+const triBool = (v) => (v === true ? true : v === false ? false : null);
+
 const enumOf = (values, fallback) => (v, path) => {
     const s = String(v).toLowerCase();
     if (values.includes(s)) return s;
@@ -393,9 +403,13 @@ const SCHEMA = {
     // offset_position (Sonos rejects offset_uri) and queue read/add/play-from
     // route through the Home Assistant Sonos integration instead of SpotifyPlus.
     sonos: {
-        defaults: { enabled: false, launch_mode: 'local', prefer_sonos: false, debug: false, device_map: [] },
+        defaults: { enabled: false, launch_mode: 'local', prefer_sonos: false, follow_sonos_card: false, debug: false, device_map: [] },
         fields: {
             enabled: bool,
+            // Play to the speaker/group selected in a sonos-card whose CTA
+            // opened the browser, instead of asking for a device. Per
+            // dashboard, since the dashboard root config is per dashboard.
+            follow_sonos_card: bool,
             // 'local' (card drives the HA Sonos entity directly, falling back to
             // SpotifyPlus) or 'spotifyplus' (all launches go through the
             // integration, e.g. with Web Player token auth).
@@ -404,7 +418,10 @@ const SCHEMA = {
             // and controls, falling back to SpotifyPlus when it has nothing.
             prefer_sonos: bool,
             debug: bool,
-            device_map: listOf({ spotify: str, entity: str, is_sonos: bool }),
+            // is_sonos is tri-state: true forces Sonos handling, false forces it
+            // OFF (overriding name heuristics), omitted falls through to
+            // auto-detection. See SonosBridge.isSonosTarget.
+            device_map: listOf({ spotify: str, entity: str, is_sonos: triBool }),
         },
     },
 

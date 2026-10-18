@@ -149,4 +149,4 @@ export class SpotifyDevicePickerSmall extends LitElement {
     }
 }
 
-customElements.define('spotify-device-picker-small', SpotifyDevicePickerSmall);
+if (!customElements.get('spotify-device-picker-small')) customElements.define('spotify-device-picker-small', SpotifyDevicePickerSmall);

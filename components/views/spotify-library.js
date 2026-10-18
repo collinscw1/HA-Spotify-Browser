@@ -1,7 +1,7 @@
 import { LitElement, html } from "../../lit.js";
 import { sharedStyles } from '../../styles/shared-styles.js';
 import { libraryStyles } from '../../styles/spotify-library.styles.js';
-import { getItemImage, isContextPlaying, getLibrarySort, setLibrarySort } from '../../utils.js';
+import { getItemImage, isContextPlaying, getLibrarySort, setLibrarySort, mapLimit } from '../../utils.js';
 import { menuIcon } from '../common/icons.js';
 
 // Filter pills. `null` = the default "Recents" view; the rest map to a saved /
@@ -153,24 +153,22 @@ class SpotifyLibrary extends LitElement {
 
             // Hydrate in parallel: playlist contexts only carry a URI; history
             // artists are simplified objects with no images.
+            // Rate-limited: this is up to ~30 individual lookups, and firing
+            // them all at once saturates the shared HA WebSocket.
             const followedById = new Map(followedArtists.map(a => [a.id, a]));
-            await Promise.all([
-                ...playlists.map(async (e) => {
-                    try {
-                        const pr = await this.api.fetchSpotifyPlus('get_playlist', { playlist_id: e.id });
-                        const p = pr?.result;
-                        if (p) { e.name = p.name; e.images = p.images; e.owner = p.owner; e.uri = p.uri || e.uri; }
-                    } catch (_) { /* drop below if unhydrated */ }
-                }),
-                ...artistEntries.map(async (e) => {
-                    const f = followedById.get(e.id);
-                    if (f?.images?.length) { e.images = f.images; return; }
-                    try {
-                        const ar = await this.api.fetchSpotifyPlus('get_artist', { artist_id: e.id });
-                        if (ar?.result?.images) e.images = ar.result.images;
-                    } catch (_) { /* renders with fallback art */ }
-                }),
-            ]);
+            const hydrate = async (e) => {
+                if (e.type === 'playlist') {
+                    const pr = await this.api.fetchSpotifyPlus('get_playlist', { playlist_id: e.id });
+                    const p = pr?.result;
+                    if (p) { e.name = p.name; e.images = p.images; e.owner = p.owner; e.uri = p.uri || e.uri; }
+                    return;
+                }
+                const f = followedById.get(e.id);
+                if (f?.images?.length) { e.images = f.images; return; }
+                const ar = await this.api.fetchSpotifyPlus('get_artist', { artist_id: e.id });
+                if (ar?.result?.images) e.images = ar.result.images;
+            };
+            await mapLimit([...playlists, ...artistEntries], 4, hydrate);
             this._recent = entries.filter(e => e.type !== 'playlist' || e.name);
         } catch (e) {
             console.error('[Library] Recent load failed', e);
@@ -526,4 +524,4 @@ class SpotifyLibrary extends LitElement {
     }
 }
 
-customElements.define('spotify-library', SpotifyLibrary);
+if (!customElements.get('spotify-library')) customElements.define('spotify-library', SpotifyLibrary);

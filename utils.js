@@ -26,6 +26,36 @@ export function debounce(func, wait) {
     };
 }
 
+/**
+ * `Promise.all(items.map(fn))` with a ceiling on how many run at once.
+ *
+ * The API governor already caps what reaches Home Assistant, but a single view
+ * firing 30 calls at once would fill its queue and starve (or shed) everyone
+ * else's work. Enrichment loops use this to stay polite neighbours. Results
+ * come back in input order; a rejected item resolves to null rather than
+ * failing the batch, since these are all best-effort lookups.
+ */
+export async function mapLimit(items, limit, fn) {
+    const list = Array.from(items || []);
+    const out = new Array(list.length);
+    let cursor = 0;
+
+    const worker = async () => {
+        while (cursor < list.length) {
+            const i = cursor++;
+            try {
+                out[i] = await fn(list[i], i);
+            } catch (_) {
+                out[i] = null;
+            }
+        }
+    };
+
+    const workers = Math.max(1, Math.min(limit, list.length));
+    await Promise.all(Array.from({ length: workers }, worker));
+    return out;
+}
+
 export function fireHaptic(hapticType) {
     const event = new CustomEvent("haptic", {
         detail: hapticType,

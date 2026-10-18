@@ -205,4 +205,4 @@ class SpotifyHeader extends LitElement {
     }
 }
 
-customElements.define('spotify-header', SpotifyHeader);
+if (!customElements.get('spotify-header')) customElements.define('spotify-header', SpotifyHeader);

@@ -154,7 +154,22 @@ Options:
 
 * `prefer_sonos` — trust the Sonos entity's own state first (default `false`). Recommended when a Sonos speaker is your main player, since local Sonos playback is invisible to the Spotify API.
 * `launch_mode` — `local` (default): the bridge drives the Sonos entity directly for launches; `spotifyplus`: launches route through SpotifyPlus (best when its Web Player token auth is set up).
-* `device_map` — usually not needed (speakers auto-match by name). Entries of `{spotify: "Living Room", entity: media_player.living_room}` fix a wrong match.
+* `device_map` — speakers auto-match by name, so this is often unnecessary. Map them explicitly when auto-matching can't get it right:
+  * **the entity id doesn't match the room name** (common after moving speakers between rooms — the id keeps its original name)
+  * **two entities share a friendly name** (e.g. a stale `unavailable` entity left over from a rename); auto-matching picks whichever HA lists first
+  * **a non-Sonos device's name overlaps a speaker's** — a Chromecast called `Google Living room` substring-matches a Sonos `Living Room`, and playback gets routed to the speaker. Rule it out with `is_sonos: false`.
+
+  ```yaml
+  device_map:
+    - spotify: Living Room            # the Spotify Connect device name
+      entity: media_player.unnamed_room_2
+      is_sonos: true
+    - spotify: Google Living room     # not a speaker — don't route it to one
+      is_sonos: false
+  ```
+
+  `is_sonos` is three-state: `true` forces Sonos handling, `false` forces it off (overriding the name heuristics), and omitting it falls through to auto-detection. With `prefer_sonos`, entries are consulted in order — list your primary speaker first.
+* `follow_sonos_card` — play to the speaker or group selected in a [sonos-card](https://github.com/collinscw1/custom-sonos-card) whose call-to-action button opened the browser, instead of asking for a device (default `false`). The card announces its selection with a `sonos-card-handoff` window event just before navigating to `#spotify-browser`; launches then go straight to that speaker (group coordinator for groups), even if Spotify is active elsewhere, and the device picker never opens on its own. Content with no local Sonos form (artists, shows) falls back to SpotifyPlus using the speaker's `device_map` name, or its room name. The handoff lasts until the browser closes; picking a device by hand overrides it.
 * `debug` — log `[Sonos]` routing decisions to the console.
 
 Notes: use SpotifyPlus v1.0.95+; the Spotify account must be linked in the Sonos app; avoid controlling the same speaker from the Sonos app while the card is driving it.
@@ -216,7 +231,7 @@ Phones and some other devices refuse remote volume control (a Spotify limitation
 * `miniplayer` — mini-player row in the sidebar. `false` hides it, or set individual buttons: `shuffle`, `previous`, `next`, `like`, `volume`, `device`.
 
 ### sonos
-See [Sonos](#sonos). Keys: `enabled` (or `sonos: true` shorthand), `prefer_sonos`, `launch_mode`, `device_map`, `debug`.
+See [Sonos](#sonos). Keys: `enabled` (or `sonos: true` shorthand), `prefer_sonos`, `launch_mode`, `follow_sonos_card`, `device_map`, `debug`.
 
 ### storage
 * `sensor` — the template sensor (default `sensor.spotify_browser_data`).

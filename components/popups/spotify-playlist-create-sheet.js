@@ -193,4 +193,4 @@ export class SpotifyPlaylistCreateSheet extends LitElement {
     }
 }
 
-customElements.define('spotify-playlist-create-sheet', SpotifyPlaylistCreateSheet);
+if (!customElements.get('spotify-playlist-create-sheet')) customElements.define('spotify-playlist-create-sheet', SpotifyPlaylistCreateSheet);
