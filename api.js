@@ -313,7 +313,7 @@ export class SpotifyApi {
      * queue order matches the list — then jumps to the tapped position once the
      * progressive load reaches it. Returns true when playback started.
      */
-    async _playSonosLocal(sonosEntity, uri, offsetPosition, offsetUri) {
+    async _playSonosLocal(sonosEntity, uri, offsetPosition, offsetUri, favoritesDevice = null) {
         if (!sonosEntity) return false;
         const isCollection = typeof uri === 'string' && uri.endsWith(':collection');
         if (isCollection) {
@@ -324,8 +324,10 @@ export class SpotifyApi {
                 if (ok) this.triggerScan();
                 return ok;
             }
+            // favoritesDevice names the speaker when SpotifyPlus may be idle
+            // (a sonos-card handoff); otherwise the active device is used.
             const res = await this.fetchSpotifyPlus('player_media_play_track_favorites',
-                { shuffle: false }, false);
+                { shuffle: false, ...(favoritesDevice && { device_id: favoritesDevice }) }, false);
             if (!res) return false;
             if (offsetPosition != null && offsetPosition > 0) {
                 // Favorites load at roughly 5 tracks/sec on the Sonos path; allow
@@ -554,11 +556,21 @@ export class SpotifyApi {
         // Active = playing, paused, or buffering. Idle/Off is not active.
         const isActive = stateObj && ['playing', 'paused', 'buffering'].includes(stateObj.state);
 
+        // A speaker handed over by the sonos-card CTA overrides everything
+        // below: no resolver (so no device picker), and it wins even when
+        // SpotifyPlus reports a different active device.
+        const handoff = !specificDevice ? this.sonosBridge?.handoffTarget : null;
+
         // 1. Determine Device Strategy
         let deviceToUse = null;
         let resolvedDeviceObj = null; // The full resolved device object (for brand/Sonos detection)
 
-        if (specificDevice) {
+        if (handoff) {
+            // Only the SpotifyPlus fallback uses this (content the local Sonos
+            // path can't launch, e.g. artists); local launches use the entity.
+            deviceToUse = this.sonosBridge.spotifyDeviceFor(handoff);
+            this.sonosBridge.log(`playMedia: handoff target ${handoff} (fallback device "${deviceToUse}") — skipping device resolution`);
+        } else if (specificDevice) {
             deviceToUse = specificDevice;
         } else {
             if (!isActive) {
@@ -591,13 +603,13 @@ export class SpotifyApi {
         // target so context jumps pick the right parameter. For the active device
         // we read brand off the entity attributes; for an idle launch we read it
         // off the resolved device object.
-        const isSonosTarget = !!this.sonosBridge && this.sonosBridge.isSonosTarget(
+        const isSonosTarget = !!handoff || (!!this.sonosBridge && this.sonosBridge.isSonosTarget(
             resolvedDeviceObj,
             isActive ? (stateObj?.attributes || {}) : {}
-        );
+        ));
         let sonosEntity = null;
         if (isSonosTarget) {
-            sonosEntity = this.sonosBridge.resolveSonosEntity(
+            sonosEntity = handoff || this.sonosBridge.resolveSonosEntity(
                 resolvedDeviceObj, isActive ? (stateObj?.attributes || {}) : {});
             // Remember the target before any volume/transport call below: a local
             // launch never engages Spotify Connect, so this memory is the only
@@ -613,7 +625,9 @@ export class SpotifyApi {
         // dynamically). Runs after Sonos detection so the volume_set routes to
         // the Sonos speaker on a Sonos launch, not the idle SpotifyPlus entity
         // (which rejects it with "no active Spotify player device").
-        if (!specificDevice && !isActive) {
+        // Not on a handoff: the volume was already chosen on the sonos-card,
+        // and on a group it would only reach the coordinator.
+        if (!specificDevice && !isActive && !handoff) {
             const vol = this._resolveDefaultVolume();
             if (vol !== null) {
                 const launchDeviceId = resolvedDeviceObj?.id || (typeof deviceToUse === 'string' ? deviceToUse : null);
@@ -638,7 +652,8 @@ export class SpotifyApi {
                     // drive the HA Sonos entity directly. Falls through to the
                     // SpotifyPlus (cloud / elevated-token) path on any failure.
                     if (isSonosTarget && this._sonosLaunchLocal()) {
-                        const played = await this._playSonosLocal(sonosEntity, uri, offset_position, offset_uri);
+                        const played = await this._playSonosLocal(sonosEntity, uri, offset_position, offset_uri,
+                            handoff ? deviceIdToTry : null);
                         if (played) return { success: true };
                     }
 
@@ -675,6 +690,13 @@ export class SpotifyApi {
                 }
                 else {
                     // C. Tracks / Fallback
+                    // Handoff single track: straight onto the speaker, like a
+                    // context launch, rather than via SpotifyPlus by name.
+                    if (handoff && !Array.isArray(uri) && this._sonosLaunchLocal()
+                        && await this.sonosBridge.playTrack(sonosEntity, uri)) {
+                        this.triggerScan();
+                        return { success: true };
+                    }
                     if (deviceIdToTry || Array.isArray(uri)) {
                         const uriArray = Array.isArray(uri) ? uri : [uri];
                         params.uris = uriArray.join(',');
@@ -711,7 +733,7 @@ export class SpotifyApi {
         // --- EXECUTE PLAYBACK ---
         const result = await executePlay(deviceToUse);
 
-        if (!specificDevice && !isActive && result.success === false && deviceToUse) {
+        if (!specificDevice && (!isActive || handoff) && result.success === false && deviceToUse) {
             this._notify(`Playback Failed on ${deviceToUse}`);
         }
 

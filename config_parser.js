@@ -403,9 +403,13 @@ const SCHEMA = {
     // offset_position (Sonos rejects offset_uri) and queue read/add/play-from
     // route through the Home Assistant Sonos integration instead of SpotifyPlus.
     sonos: {
-        defaults: { enabled: false, launch_mode: 'local', prefer_sonos: false, debug: false, device_map: [] },
+        defaults: { enabled: false, launch_mode: 'local', prefer_sonos: false, follow_sonos_card: false, debug: false, device_map: [] },
         fields: {
             enabled: bool,
+            // Play to the speaker/group selected in a sonos-card whose CTA
+            // opened the browser, instead of asking for a device. Per
+            // dashboard, since the dashboard root config is per dashboard.
+            follow_sonos_card: bool,
             // 'local' (card drives the HA Sonos entity directly, falling back to
             // SpotifyPlus) or 'spotifyplus' (all launches go through the
             // integration, e.g. with Web Player token auth).

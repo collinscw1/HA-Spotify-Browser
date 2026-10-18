@@ -27,6 +27,33 @@ export class SonosBridge {
         // this memory is what keeps display/control routed to the speaker.
         this._lastEntity = null;
         this._launchGraceUntil = 0;
+        // Speaker/group the sonos-card's CTA handed over when it opened the
+        // browser. Lives for one browser session; see setHandoff.
+        this._handoff = null;
+    }
+
+    /**
+     * Set (or clear, with null) the speaker handed over by the sonos-card CTA.
+     * While set, launches go straight to it — no device picker — and it wins
+     * now-playing while it's playing Spotify. Ignored unless
+     * sonos.follow_sonos_card is on.
+     */
+    setHandoff(entity) {
+        this._handoff = (this.enabled && this.config?.follow_sonos_card && entity) || null;
+        if (this._handoff) this.log(`handoff: sonos-card selected ${this._handoff}`);
+    }
+
+    get handoffTarget() { return this._handoff; }
+
+    /**
+     * The Spotify Connect device to name for the SpotifyPlus fallback when a
+     * local launch can't serve a content type (artist/show). SpotifyPlus
+     * accepts a device name as device_id; prefer the device_map's Spotify
+     * name, else the speaker's room name.
+     */
+    spotifyDeviceFor(entity) {
+        const entry = this._deviceMap.find(m => m.entity === entity && m.spotify);
+        return entry?.spotify || this.hass?.states?.[entity]?.attributes?.friendly_name || null;
     }
 
     /**
@@ -207,6 +234,21 @@ export class SonosBridge {
      */
     activeTarget(attributes = {}) {
         if (!this.enabled) return { isSonos: false, entity: null };
+
+        // The speaker the sonos-card handed over is what the user is looking
+        // at — it beats prefer_sonos's device_map order, which would otherwise
+        // show whichever mapped speaker happens to be listed first. Only while
+        // it's actually on Spotify (or just launched), so a handoff speaker
+        // playing TV audio doesn't hijack now-playing.
+        if (this._handoff) {
+            const s = this.hass?.states?.[this._handoff];
+            const live = ['playing', 'paused', 'buffering'].includes(s?.state) && SonosBridge._isSpotifyContent(s);
+            const justLaunched = this._lastEntity === this._handoff && Date.now() < this._launchGraceUntil;
+            if (live || justLaunched) {
+                this._lastEntity = this._handoff;
+                return { isSonos: true, entity: this._handoff };
+            }
+        }
 
         // Explicit preference (sonos.prefer_sonos): the mapped speaker(s) are the
         // primary player — trust their own state before any Connect detection.

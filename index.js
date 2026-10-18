@@ -85,6 +85,11 @@ class SpotifyExtension {
         // Deep-link straight to the mobile Now Playing surface (over home).
         window.addEventListener('spotify-browser-open-now-playing', () => this._open(true));
 
+        // A sonos-card CTA announces its selected speaker/group just before
+        // navigating to our hash; record it so the open that follows plays
+        // there (sonos.follow_sonos_card).
+        window.addEventListener('sonos-card-handoff', (e) => this.app?.setHandoff(e.detail?.entityId));
+
         // Listen for URL Hash changes (Browser Back/Forward or Manual URL entry)
         window.addEventListener('hashchange', this._boundCheckHash);
 

@@ -507,6 +507,16 @@ class SpotifyBrowserApp extends LitElement {
         }
     }
 
+    /**
+     * Record the speaker/group a sonos-card's CTA handed over (it fires just
+     * before the hash navigation that opens the browser). Builds the API
+     * first so the bridge exists on a cold first open.
+     */
+    setHandoff(entity) {
+        if (!this.api) this._initApi();
+        this.sonosBridge?.setHandoff(entity);
+    }
+
     open(opts = {}) {
         this._isOpen = true;
 
@@ -943,6 +953,14 @@ class SpotifyBrowserApp extends LitElement {
                 const errMsg = err.message || '';
                 if (errCode === 'service_validation_error' || errMsg.includes('not found') || errMsg.includes('Validation error')) {
                     const popups = this.shadowRoot.getElementById('popups');
+                    // The sonos-card already chose the speaker; a picker here
+                    // would just second-guess it.
+                    const handoff = this.sonosBridge?.handoffTarget;
+                    if (handoff) {
+                        const name = this.hass?.states?.[handoff]?.attributes?.friendly_name || handoff;
+                        if (popups) popups.showToast(`Couldn't play that on ${name}.`);
+                        return;
+                    }
                     if (popups) popups.showToast("Device unavailable. Please select a player.");
                     this._openDevicePicker();
                 } else {
@@ -1069,6 +1087,9 @@ class SpotifyBrowserApp extends LitElement {
     }
 
     _handleDeviceSelected(e) {
+        // An explicit pick overrides the sonos-card's speaker for the rest of
+        // this session.
+        this.sonosBridge?.setHandoff(null);
         if (this._pendingDeviceResolution) {
             // Resolve the pending promise (API is waiting)
             this._pendingDeviceResolution(e.detail);
@@ -1727,6 +1748,9 @@ class SpotifyBrowserApp extends LitElement {
             this._pendingDeviceResolution(null);
             this._pendingDeviceResolution = null;
         }
+        // The sonos-card hands its speaker over afresh on every CTA open; a
+        // stale one must not follow an open from anywhere else.
+        this.sonosBridge?.setHandoff(null);
     }
 
     /* Slide the panel down then close (mobile iOS-panel dismiss). */
